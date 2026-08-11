@@ -17,6 +17,7 @@ if ! command -v docker >/dev/null 2>&1; then
 fi
 
 echo "==> Building image $IMAGE"
+# Classic `docker build` loads the image into the local engine (required for `docker run`).
 if [[ "${1:-}" == "--no-cache" ]]; then
   docker build --no-cache \
     --build-arg "ARDUINO_CLI_VERSION=${ARDUINO_CLI_VERSION}" \

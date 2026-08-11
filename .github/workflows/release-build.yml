@@ -16,9 +16,8 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
+      # Use the runner's default Docker engine (not buildx container driver).
+      # buildx without --load leaves images unavailable for `docker run`.
       - name: Build firmware (pinned Docker)
         run: |
           chmod +x scripts/*.sh
