@@ -6,7 +6,7 @@ Open-source firmware for SeedMask hardware (ESP32-S3).
 
 This tree is the **corresponding source** for SeedMask device firmware builds.
 
-- **License:** [GNU GPLv3](LICENSES/GPL-3.0.txt) — see [LICENSE](LICENSE)
+- **License:** [GNU GPLv3](LICENSE) — see also [LICENSE.note](LICENSE.note) and [LICENSES/GPL-3.0.txt](LICENSES/GPL-3.0.txt)
 - **Third-party code:** [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) (Trezor, secp256k1, Blockchain Commons, quirc, GFX, Passport-related GPL, …)
 
 When this repository is published on GitHub, use that URL as the public source link for the product (example):
