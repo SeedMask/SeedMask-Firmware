@@ -1,0 +1,53 @@
+name: Reproducible firmware build
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build firmware (pinned Docker)
+        run: |
+          chmod +x scripts/*.sh
+          ./scripts/docker-build.sh
+
+      - name: Show hashes
+        run: cat dist/SHA256SUMS
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: seedmask-firmware-dist
+          path: |
+            dist/SeedMask_Firmware.bin
+            dist/SeedMask_Firmware.bootloader.bin
+            dist/SeedMask_Firmware.partitions.bin
+            dist/SeedMask_Firmware.merged.bin
+            dist/SHA256SUMS
+
+      - name: Attach to GitHub Release (tags only)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/SeedMask_Firmware.bin
+            dist/SeedMask_Firmware.bootloader.bin
+            dist/SeedMask_Firmware.partitions.bin
+            dist/SeedMask_Firmware.merged.bin
+            dist/SHA256SUMS
+          fail_on_unmatched_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

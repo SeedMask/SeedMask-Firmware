@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 300 420" fill="none">
+  <rect width="300" height="420" fill="#FFFFFF"/>
+  <!-- Left half: teal with negative-space S cutouts (exact 50% split at x=150) -->
+  <path fill="#3BDBBF" fill-rule="evenodd" d="
+    M 150 8
+    C 62 36 14 126 6 205
+    C 14 294 62 382 150 412
+    L 150 8
+    Z
+    M 42 134 L 150 134 L 150 152 L 42 152 Z
+    M 150 152 L 94 152 L 110 212 L 150 212 Z
+    M 42 258 L 150 258 L 150 276 L 42 276 Z
+  "/>
+  <!-- Right half: mask (mirrored outer curve, exact 50% split) -->
+  <path fill="#111111" fill-rule="evenodd" d="
+    M 150 8
+    C 238 36 286 126 294 205
+    C 286 294 238 382 150 412
+    L 150 8
+    Z
+    M 150 68 L 226 54 L 246 84 L 166 98 Z
+    M 150 174
+    C 186 166 244 174 272 196
+    C 244 218 186 226 150 218
+    C 166 206 166 186 150 174
+    Z
+  "/>
+</svg>

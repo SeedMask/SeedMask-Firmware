@@ -1,0 +1,1 @@
+esp32:esp32:esp32s3:JTAGAdapter=default,PSRAM=opi,FlashMode=qio,FlashSize=16M,LoopCore=1,EventsCore=1,USBMode=default,CDCOnBoot=cdc,MSCOnBoot=default,DFUOnBoot=default,UploadMode=cdc,PartitionScheme=huge_app,CPUFreq=240,UploadSpeed=921600,DebugLevel=none,ZigbeeMode=default

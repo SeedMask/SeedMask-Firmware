@@ -1,0 +1,25 @@
+.DS_Store
+**/.DS_Store
+__pycache__/
+*.py[cod]
+.pydeps/
+*.o
+*.elf
+*.map
+a.out
+node_modules/
+.vscode/
+.idea/
+*.vsix.bak
+dist/
+# Local Arduino IDE / arduino-cli sketch build tree (not release pins in /build)
+SeedMask_Firmware/build/
+**/_crypto_new_account_preview*.png
+**/_compare_export_vs_new_account.png
+**/_export_xpub_preview.png
+**/_debug_*.png
+**/preview_icon_*.png
+**/sd_icon_preview.png
+**/multisig_settings_icon_preview.png
+# Host CMake output under vendored libsecp256k1 (not used by Arduino/Docker build)
+SeedMask_Firmware/third_party/libsecp256k1/build/

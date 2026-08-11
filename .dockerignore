@@ -1,0 +1,10 @@
+dist/
+.git/
+**/.DS_Store
+**/__pycache__/
+**/.pydeps/
+**/node_modules/
+SeedMask_Firmware/tools/kaspa_wasm_node/
+plugins/
+*.bin
+a.out

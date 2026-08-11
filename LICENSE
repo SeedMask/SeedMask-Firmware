@@ -1,0 +1,26 @@
+SeedMask Firmware
+=================
+
+Copyright (c) SeedMask contributors.
+
+This repository contains original SeedMask code and third-party open-source
+components (see THIRD_PARTY_NOTICES.md).
+
+Because some incorporated components are licensed under the GNU General Public
+License version 3 (or later), **the SeedMask device firmware in this repository
+is distributed under the GNU GPLv3**.
+
+The full text of the GNU General Public License version 3 is in:
+
+  LICENSES/GPL-3.0.txt
+
+You may copy, modify, and redistribute this firmware under the terms of the
+GPLv3. When you distribute binaries (including firmware flashed on hardware you
+sell or give away), you must also make the corresponding source available under
+the same license.
+
+Individual third-party files keep their original copyright holders and license
+terms. Those licenses are listed in THIRD_PARTY_NOTICES.md and in LICENSE /
+COPYING files next to the vendored code. Do not remove those notices.
+
+This is not legal advice; if in doubt, talk to a lawyer before shipping.

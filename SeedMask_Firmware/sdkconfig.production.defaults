@@ -1,0 +1,18 @@
+# Reference only — NOT a complete sdkconfig.
+# Merge selected options via idf.py menuconfig or sdkconfig.defaults after reading
+# Espressif Security Guides for your exact chip (ESP32 / ESP32-S2 / ESP32-S3 / C3 / etc.).
+#
+# Typical production-oriented options to review (names vary by IDF version):
+#
+# CONFIG_SECURE_BOOT=y
+# CONFIG_SECURE_BOOT_BUILD_SIGNED_BINARIES=y
+# CONFIG_SECURE_FLASH_ENC_ENABLED=y
+# CONFIG_SECURE_FLASH_ENCRYPTION_MODE_RELEASE=y
+#
+# Debug / console (product policy):
+# CONFIG_ESP_CONSOLE_UART_NONE=y   # example: disable ROM console if acceptable
+#
+# Anti-rollback (optional):
+# CONFIG_BOOTLOADER_APP_ANTI_ROLLBACK=y
+#
+# Flash encryption key in eFuse: follow Espressif "Flash Encryption" chapter end-to-end.

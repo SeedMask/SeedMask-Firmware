@@ -1,0 +1,45 @@
+/* Bitcoin signed-message compact sig via libsecp256k1 (same stack as Bitcoin Core / Sparrow Drongo). */
+
+#include <stddef.h>
+#include <stdint.h>
+#include <string.h>
+
+#include "src/trezor_firmware/vendor/secp256k1-zkp/include/secp256k1.h"
+#include "src/trezor_firmware/vendor/secp256k1-zkp/include/secp256k1_recovery.h"
+
+static secp256k1_context *g_secp_ctx;
+
+static secp256k1_context *secp_ctx_get(void) {
+  if (!g_secp_ctx) {
+    g_secp_ctx = secp256k1_context_create(SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+  }
+  return g_secp_ctx;
+}
+
+/* 65 bytes: header | r (32 BE) | s (32 BE); header = 39 + recid (P2WPKH, Drongo). */
+int seedmask_libsecp256k1_message_sign_compact(const uint8_t *priv32, const uint8_t *hash32,
+                                             uint8_t *compact65) {
+  if (!priv32 || !hash32 || !compact65) {
+    return 0;
+  }
+  secp256k1_context *ctx = secp_ctx_get();
+  if (!ctx) {
+    return 0;
+  }
+  secp256k1_ecdsa_recoverable_signature rsig;
+  memset(&rsig, 0, sizeof(rsig));
+  if (!secp256k1_ecdsa_sign_recoverable(ctx, &rsig, hash32, priv32, NULL, NULL)) {
+    return 0;
+  }
+  int recid = 0;
+  unsigned char sig64[64];
+  if (!secp256k1_ecdsa_recoverable_signature_serialize_compact(ctx, sig64, &recid, &rsig)) {
+    return 0;
+  }
+  if (recid < 0 || recid > 3) {
+    return 0;
+  }
+  compact65[0] = (unsigned char)(39 + recid);
+  memcpy(compact65 + 1, sig64, 64);
+  return 1;
+}
