@@ -45,7 +45,8 @@ coverage.*.html
 *.gcno
 *.gcov
 
-src/libsecp256k1-config.h
+# SeedMask ships a checked-in Arduino config header (not cmake-generated).
+# src/libsecp256k1-config.h
 src/libsecp256k1-config.h.in
 src/ecmult_static_context.h
 build-aux/config.guess
