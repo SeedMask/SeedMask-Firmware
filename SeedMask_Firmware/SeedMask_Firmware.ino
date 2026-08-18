@@ -45,6 +45,9 @@ extern "C" {
 #include "tiktok_logo_50_rgb565.h"
 #include "common_password_hashes_top20k.h"
 #include <Preferences.h>
+#include "nvs_flash.h"
+#include "esp_partition.h"
+#include "esp_task_wdt.h"
 #include <FS.h>
 #include <dirent.h>
 #include "bsp/bsp_sdcard.h"
@@ -432,11 +435,14 @@ static bool persist_session_seed_vault_to_nvs(const char* password);
 static bool nvs_clear_vault();
 static bool nvs_clear_vault_pw();
 static void edit_clear();
+static void clearPassword(char* p);
 static void load_passwords_notes_from_nvs(const char* masterPw);
 static void save_passwords_notes_to_nvs(void);
+static void menu_draw_message_card_overlay(void);
 static bool decoy_vault_persist_active(void);
 static bool session_can_persist_vault_data(void);
 static bool session_persist_vault_requires_sd(void);
+static bool vault_require_sd_for_pm_save(void);
 static bool vault_commit_passwords_notes_persist(void);
 static bool burgerMenuHideSeedAndSecurity(void);
 static bool burgerMenuHideSecurity(void);
@@ -610,6 +616,7 @@ static void handlePassphraseClearConfirmTap(uint16_t x, uint16_t y);
 static void drawWipeConfirm();
 static void handleWipeConfirmTap(uint16_t x, uint16_t y);
 static void drawWipeInfo();
+static void drawWipeBusyScreen(uint8_t percent);
 static void handleWipeInfoTap(uint16_t x, uint16_t y);
 static void drawWipeInfoBitmapAt(int16_t cx, int16_t cy, bool large, int16_t ox = 0, int16_t oy = 0, float brightnessMul = 1.f);
 static void drawCryptoConnectSoftware();
@@ -683,6 +690,7 @@ enum class UIScreen : uint8_t {
 
   CREATE_PICK,
   CREATE_ENTROPY_METHOD,  // Hardware entropy vs Dice roll
+  CREATE_ENTROPY_HW_WARN, // Standard TRNG: unmeasured — continue or swipe back to dice
   CREATE_DICE_WORDS,      // 12/24 before dice rolling
   CREATE_DICE_ROLL,       // enter rolls via on-screen dice
   CREATE_GEN,
@@ -2371,6 +2379,11 @@ static void setMsg(const char* m) {
   }
 }
 
+static const char kMsgVaultPwCreated[] =
+  "Save this password. It recovers your vault, and the backup code uses it too.";
+static const char kMsgBackupPwCreated[] =
+  "Save this password. The vault reuses this password.";
+
 /** Toast meant for the main menu only — survives show(MENU); all other navigation clears stale g_msg. */
 static void setMenuToast(const char* m, uint32_t autoHideMs = 0) {
   setMsg(m);
@@ -2640,11 +2653,43 @@ static void load_unix_time_from_prefs() {
 static String group4(const String& s) {
   String out;
   out.reserve(s.length() + s.length() / 4 + 8);
-  for (size_t i = 0; i < s.length(); i++) {
-    if (i && (i % 4 == 0)) out += '-';
+  const size_t n = s.length();
+  const size_t rem = n % 4;
+  for (size_t i = 0; i < n; i++) {
+    // Keep a short leftover on the last group (24-word SPB1 is 69 chars → idle "-k").
+    if (i && (i % 4 == 0) && !(rem && i + rem == n)) out += '-';
     out += s[i];
   }
   return out;
+}
+
+#ifndef BACKUP_SPB1_COMPACT_MAX
+#define BACKUP_SPB1_COMPACT_MAX 96
+#endif
+/** Unhyphenated Base32 body after SPB1 (v2). 12-word even; 24-word last box is 5 chars. */
+#ifndef BACKUP_SPB1_PAYLOAD_12
+#define BACKUP_SPB1_PAYLOAD_12 44
+#define BACKUP_SPB1_PAYLOAD_24 69
+#endif
+
+static void backup_spb1_compact_chars(const char* code, char* out, size_t outLen) {
+  if (!out || outLen == 0) return;
+  out[0] = 0;
+  if (!code) return;
+  size_t o = 0;
+  for (size_t i = 0; code[i] && o + 1 < outLen; i++) {
+    char c = code[i];
+    if (c == '-' || c == ' ' || c == '\n' || c == '\r' || c == '\t') continue;
+    if (c >= 'a' && c <= 'z') c = (char)(c - 'a' + 'A');
+    out[o++] = c;
+  }
+  out[o] = 0;
+}
+
+static bool backup_spb1_compact_ok(const char* compact) {
+  if (!compact) return false;
+  size_t n = strlen(compact);
+  return n >= 8 && n < BACKUP_SPB1_COMPACT_MAX && strncmp(compact, "SPB1", 4) == 0;
 }
 
 // Parse serialized notes (title\tbody\n per line) into g_noteItems and g_noteCount.
@@ -2759,6 +2804,11 @@ static bool unpack_seed_indices(const uint8_t* in, uint8_t wc, uint16_t* idxOut)
 // Iteration count is not stored in vault headers — changing this breaks decryption of data encrypted with the old count.
 // TODO: raise to 500000 once UX allows (shutdown was ~1 min at higher counts). Previously 100000 in-repo.
 #define PBKDF2_ITERATIONS 10000
+// Portable SPB1 backup codes only. Do not use for vault AES-GCM / NVS / PIN.
+#define BACKUP_PBKDF2_ITERATIONS 100000
+#define BACKUP_PASSWORD_MIN_LEN 12
+#define BACKUP_SPB1_VERSION 2
+#define BACKUP_SPB1_MAC_LEN 4
 static bool pbkdf2_sha256(const uint8_t* pw, size_t pwLen,
                           const uint8_t* salt, size_t saltLen,
                           uint32_t iters,
@@ -2835,6 +2885,44 @@ static void xor_keystream(const uint8_t key[32], uint8_t* data, size_t len) {
     counter++;
   }
 }
+
+// SPB1 v2 MAC: HMAC-SHA256(key, "SPB1" || ver || wc || salt || ciphertext), truncated to 4 bytes.
+static bool backup_spb1_mac4(const uint8_t key[32], uint8_t ver, uint8_t wc,
+                             const uint8_t salt[4], const uint8_t* ct, size_t ctLen,
+                             uint8_t out4[4]) {
+  if (!key || !salt || !ct || !out4 || ctLen > 33) return false;
+  uint8_t msg[4 + 1 + 1 + 4 + 33];
+  size_t n = 0;
+  memcpy(msg + n, "SPB1", 4);
+  n += 4;
+  msg[n++] = ver;
+  msg[n++] = wc;
+  memcpy(msg + n, salt, 4);
+  n += 4;
+  memcpy(msg + n, ct, ctLen);
+  n += ctLen;
+  uint8_t full[32];
+  if (!hmac_sha256(key, 32, msg, n, full)) {
+    secure_memzero(msg, sizeof(msg));
+    return false;
+  }
+  memcpy(out4, full, BACKUP_SPB1_MAC_LEN);
+  secure_memzero(full, sizeof(full));
+  secure_memzero(msg, sizeof(msg));
+  return true;
+}
+
+static bool backup_mac4_eq(const uint8_t a[4], const uint8_t b[4]) {
+  uint8_t d = 0;
+  d |= (uint8_t)(a[0] ^ b[0]);
+  d |= (uint8_t)(a[1] ^ b[1]);
+  d |= (uint8_t)(a[2] ^ b[2]);
+  d |= (uint8_t)(a[3] ^ b[3]);
+  return d == 0;
+}
+
+static bool password_is_top_common_password(const char* pw);
+static bool backup_password_ok_for_create(const char* password);
 
 // =======================
 // Bitcoin address explorer helpers (BIP32 + P2PKH/P2SH-P2WPKH/P2WPKH)
@@ -5169,14 +5257,197 @@ static bool nvs_clear_vault_pw() {
   return true;
 }
 
-static void nvs_wipe() {
-  // Clear the vault blob (namespace "vault", key "vault_blob") — this is where the vault lives.
-  nvs_clear_vault();
-  nvs_clear_vault_pw();
-  // Clear any other app state in "seedmask" namespace.
-  prefs.begin("seedmask", false);
-  prefs.clear();
+#ifndef SEEDMASK_WIPE_CHUNK
+#define SEEDMASK_WIPE_CHUNK 4096u
+#endif
+
+static uint64_t s_wipeWorkDone = 0;
+static uint64_t s_wipeWorkTotal = 1;
+static uint32_t s_wipeLastDrawMs = 0;
+static bool s_wipeShowProgress = true;
+static volatile bool s_silentSpiffsWipeBusy = false;
+
+static void wipe_feed_wdt(void) {
+  delay(1);
+  esp_task_wdt_reset();
+}
+
+/** Pause SPIFFS overwrite while the lock screen is being used; resume after a short idle. */
+static void silent_wipe_yield_to_ui(void) {
+  if (!s_silentSpiffsWipeBusy || s_wipeShowProgress) return;
+  for (;;) {
+    if (!g_busy && (uint32_t)(millis() - g_lastUserActivityMs) >= 600u) break;
+    esp_task_wdt_reset();
+    vTaskDelay(pdMS_TO_TICKS(20));
+  }
+  vTaskDelay(pdMS_TO_TICKS(2));
+}
+
+static void wipe_progress_ui(void) {
+  if (!s_wipeShowProgress) return;
+  uint8_t pct = 0;
+  if (s_wipeWorkTotal > 0) {
+    uint64_t p = (s_wipeWorkDone * 100ull) / s_wipeWorkTotal;
+    if (p > 100) p = 100;
+    pct = (uint8_t)p;
+  }
+  uint32_t now = millis();
+  if (s_wipeLastDrawMs != 0 && (uint32_t)(now - s_wipeLastDrawMs) < 250u) return;
+  s_wipeLastDrawMs = now;
+  drawWipeBusyScreen(pct);
+}
+
+static bool seedmask_data_part_should_secure_wipe(const esp_partition_t* p) {
+  if (!p || p->type != ESP_PARTITION_TYPE_DATA) return false;
+  switch (p->subtype) {
+    case ESP_PARTITION_SUBTYPE_DATA_NVS:
+    case ESP_PARTITION_SUBTYPE_DATA_SPIFFS:
+    case ESP_PARTITION_SUBTYPE_DATA_FAT:
+    case ESP_PARTITION_SUBTYPE_DATA_COREDUMP:
+      return true;
+    default:
+      return false;
+  }
+}
+
+/** Erase → random overwrite → erase. Size must be a multiple of 4096. */
+static bool seedmask_secure_erase_partition(const esp_partition_t* p) {
+  if (!p || p->size < SEEDMASK_WIPE_CHUNK) return false;
+  const size_t n = p->size - (p->size % SEEDMASK_WIPE_CHUNK);
+  if (n == 0) return false;
+
+  uint8_t* chunk = (uint8_t*)heap_caps_malloc(SEEDMASK_WIPE_CHUNK, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  if (!chunk) chunk = (uint8_t*)malloc(SEEDMASK_WIPE_CHUNK);
+  if (!chunk) return false;
+
+  bool ok = true;
+  for (int pass = 0; pass < 3 && ok; pass++) {
+    for (size_t off = 0; off < n && ok; off += SEEDMASK_WIPE_CHUNK) {
+      if (pass == 1) {
+        esp_fill_random(chunk, SEEDMASK_WIPE_CHUNK);
+        if (esp_partition_write(p, off, chunk, SEEDMASK_WIPE_CHUNK) != ESP_OK) ok = false;
+      } else {
+        if (esp_partition_erase_range(p, off, SEEDMASK_WIPE_CHUNK) != ESP_OK) ok = false;
+      }
+      s_wipeWorkDone += SEEDMASK_WIPE_CHUNK;
+      wipe_feed_wdt();
+      wipe_progress_ui();
+      silent_wipe_yield_to_ui();
+    }
+  }
+  secure_memzero(chunk, SEEDMASK_WIPE_CHUNK);
+  free(chunk);
+  return ok;
+}
+
+static void seedmask_nvs_reinit_after_wipe(void) {
+  esp_err_t err = nvs_flash_init();
+  if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND || err != ESP_OK) {
+    (void)nvs_flash_erase();
+    err = nvs_flash_init();
+  }
+  (void)err;
+}
+
+static bool seedmask_wipe_part_is_nvs(const esp_partition_t* p) {
+  return p && p->type == ESP_PARTITION_TYPE_DATA && p->subtype == ESP_PARTITION_SUBTYPE_DATA_NVS;
+}
+
+/** which: 0 = NVS only, 1 = non-NVS data (SPIFFS/FAT/coredump), 2 = all secure-wipe data. */
+static bool seedmask_secure_erase_data_parts(int which) {
+  bool anyFail = false;
+  for (esp_partition_iterator_t it = esp_partition_find(ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_ANY, NULL);
+       it != NULL; it = esp_partition_next(it)) {
+    const esp_partition_t* p = esp_partition_get(it);
+    if (!seedmask_data_part_should_secure_wipe(p)) continue;
+    const bool isNvs = seedmask_wipe_part_is_nvs(p);
+    if (which == 0 && !isNvs) continue;
+    if (which == 1 && isNvs) continue;
+    if (!seedmask_secure_erase_partition(p)) anyFail = true;
+  }
+  return anyFail;
+}
+
+static void nvs_wipe_wait_bg_spiffs(void) {
+  uint32_t t0 = millis();
+  while (s_silentSpiffsWipeBusy && (uint32_t)(millis() - t0) < 120000u) {
+    wipe_feed_wdt();
+  }
+}
+
+static void nvs_wipe_begin(bool showProgress) {
+  g_deferred_nvs_save_pending = false;
+  g_deferred_vault_len = 0;
+  secure_memzero(g_deferred_vault_buf, sizeof(g_deferred_vault_buf));
   prefs.end();
+
+  s_wipeShowProgress = showProgress;
+  s_wipeWorkDone = 0;
+  s_wipeWorkTotal = 1;
+  s_wipeLastDrawMs = 0;
+
+  uint64_t work = 0;
+  for (esp_partition_iterator_t it = esp_partition_find(ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_ANY, NULL);
+       it != NULL; it = esp_partition_next(it)) {
+    const esp_partition_t* p = esp_partition_get(it);
+    if (seedmask_data_part_should_secure_wipe(p)) {
+      size_t n = p->size - (p->size % SEEDMASK_WIPE_CHUNK);
+      work += (uint64_t)n * 3ull;
+    }
+  }
+  if (work == 0) work = 1;
+  s_wipeWorkTotal = work;
+  if (showProgress) drawWipeBusyScreen(0);
+
+  (void)nvs_flash_deinit();
+}
+
+static void silent_spiffs_wipe_task(void* arg) {
+  (void)arg;
+  s_wipeShowProgress = false;
+  (void)seedmask_secure_erase_data_parts(1);
+  s_wipeShowProgress = true;
+  s_silentSpiffsWipeBusy = false;
+  vTaskDelete(NULL);
+}
+
+static void nvs_wipe_start_spiffs_bg(void) {
+  if (s_silentSpiffsWipeBusy) return;
+  s_silentSpiffsWipeBusy = true;
+  s_wipeShowProgress = false;
+  BaseType_t ok = xTaskCreate(silent_spiffs_wipe_task, "sil_wipe", 8192, NULL, 0, NULL);
+  if (ok != pdPASS) {
+    s_silentSpiffsWipeBusy = false;
+    (void)seedmask_secure_erase_data_parts(1);
+    s_wipeShowProgress = true;
+  }
+}
+
+/** NVS 3-pass only (seed). Caller persists hollow lock, then starts SPIFFS in the background. */
+static void nvs_wipe_silent_seed(void) {
+  nvs_wipe_wait_bg_spiffs();
+  nvs_wipe_begin(false);
+  (void)seedmask_secure_erase_data_parts(0);
+  seedmask_nvs_reinit_after_wipe();
+  s_wipeShowProgress = true;
+}
+
+/** Secure wipe of NVS / SPIFFS (and fat/coredump if present). Does not touch firmware or microSD.
+ *  showProgress: Device Wipe UI. Silent lockout wipe keeps the lock screen. */
+static void nvs_wipe(bool showProgress) {
+  nvs_wipe_wait_bg_spiffs();
+  nvs_wipe_begin(showProgress);
+  bool anyFail = seedmask_secure_erase_data_parts(2);
+  seedmask_nvs_reinit_after_wipe();
+  if (anyFail) {
+    nvs_clear_vault();
+    nvs_clear_vault_pw();
+    prefs.begin("seedmask", false);
+    prefs.clear();
+    prefs.end();
+  }
+  if (showProgress) drawWipeBusyScreen(100);
+  s_wipeShowProgress = true;
 }
 
 // Runs on its own stack (4KB) so loop task never calls nvs_save_vault
@@ -5280,6 +5551,7 @@ static bool swipeHintPeriodicDrawSuppressed(UIScreen s) {
     case UIScreen::ERROR_SCREEN:
     case UIScreen::CREATE_PICK:
     case UIScreen::CREATE_ENTROPY_METHOD:
+    case UIScreen::CREATE_ENTROPY_HW_WARN:
     case UIScreen::CREATE_DICE_WORDS:
     case UIScreen::CREATE_DICE_ROLL:
     case UIScreen::CREATE_GEN:
@@ -5833,7 +6105,7 @@ static size_t g_pinWrapBlobLen = 0;
 static uint8_t g_pinSalt[16];
 /** Silent wipe: erase seed without leaving LOCKED; persist pref across NVS wipe. Default off. */
 static bool g_lockoutWipeSilently = false;
-/** True after silent wipe until correct credential sends user HOME (RAM-only verifier held in s_lockoutSv*). */
+/** True after silent wipe until correct credential sends user HOME. Verifier in s_lockoutSv*; NVS hl_* survives reboot. */
 static bool g_lockoutSilentWipeArmed = false;
 /** Silent wipe ran but no RAM snapshot: cannot verify unlock — stay on LOCKED, never treat as "no vault" → HOME. */
 static bool g_lockoutSilentNoVerify = false;
@@ -5841,10 +6113,12 @@ static uint8_t s_lockoutSvPinWrap[PIN_WRAP_BLOB_MAX];
 static size_t s_lockoutSvPinWrapLen = 0;
 static uint8_t s_lockoutSvSalt[16];
 static uint8_t s_lockoutSvSlMode = 0;
-/** Vault-password-only lock: encrypted vault blob only (no plaintext password). PIN/separate use wrap only. */
-#define LOCKOUT_SILENT_VAULT_BUF_MAX 192
-static uint8_t s_lockoutSvVaultBuf[LOCKOUT_SILENT_VAULT_BUF_MAX];
-static size_t s_lockoutSvVaultLen = 0;
+/** Vault-password lock: wrap of a constant (not the seed), so reboot can still check the password. */
+static const char kHollowVpwWrapPayload[] = "__HOLLOW_LOCK_V1__";
+static uint8_t s_hollowVpwWrap[PIN_WRAP_BLOB_MAX];
+static size_t s_hollowVpwWrapLen = 0;
+static uint8_t s_hollowVpwSalt[16];
+static bool s_hollowVpwValid = false;
 // Duress: separate credential per type (empty / games / decoy); global PIN vs password kind.
 static DuressTypeSlot g_duressSlotEmpty;
 static DuressTypeSlot g_duressSlotGames;
@@ -6413,6 +6687,8 @@ static void drawDuressSpace() {
 
 static bool g_creatingMasterPassword = false;  // Flag for master password creation flow
 static bool g_createBackupFromSeedSettings = false;
+static bool g_createVaultPasswordThenAdd = false;  // ADD passwords/notes/2FA → set user vault password first
+static UIScreen g_vaultPwThenAddReturn = UIScreen::PASSWORDS;
 static UIScreen g_backupShowCodeReturnScreen = UIScreen::MENU;
 
 static char g_tmpTitle[128] = { 0 };    // Name field + packed title metadata (see PwItem::title)
@@ -8387,6 +8663,11 @@ static void rebuildVaultQrPayload() {
 // Backup code file on microSD (will be set dynamically)
 // =======================
 static char BC_FILE[192] = "/sdcard/seedmask/backup_v1.bin";
+/** Basename of BC_FILE (e.g. Backup_A1B2C3D4.bin). */
+static const char* backup_code_sd_basename(void) {
+  const char* slash = strrchr(BC_FILE, '/');
+  return (slash && slash[1]) ? (slash + 1) : BC_FILE;
+}
 /** Full path of last Backup / encrypted backup-code file opened from SD (for PW_<xfp>.bin fallback). */
 static char g_lastSdBackupCodePath[192] = { 0 };
 
@@ -9843,23 +10124,151 @@ static void drawLockoutShowToggle(const Rect& r, bool on) {
   gfx->drawCircle(knobCx, knobCy, knobR, UI_BORDER);
 }
 
+static void lockout_clear_vpw_prewrap_ram() {
+  secure_memzero(s_hollowVpwWrap, sizeof(s_hollowVpwWrap));
+  s_hollowVpwWrapLen = 0;
+  secure_memzero(s_hollowVpwSalt, sizeof(s_hollowVpwSalt));
+  s_hollowVpwValid = false;
+}
+
 static void lockout_clear_silent_wipe_snapshot() {
   secure_memzero(s_lockoutSvPinWrap, sizeof(s_lockoutSvPinWrap));
   s_lockoutSvPinWrapLen = 0;
   secure_memzero(s_lockoutSvSalt, sizeof(s_lockoutSvSalt));
   s_lockoutSvSlMode = 0;
-  if (s_lockoutSvVaultLen > 0) {
-    secure_memzero(s_lockoutSvVaultBuf, s_lockoutSvVaultLen);
-    s_lockoutSvVaultLen = 0;
-  }
   g_lockoutSilentWipeArmed = false;
   g_lockoutSilentNoVerify = false;
 }
 
+static bool session_should_show_lock_screen() {
+  return (g_hasVault && !g_stateless) || g_lockoutSilentWipeArmed || g_lockoutSilentNoVerify;
+}
+
+static void lockout_nvs_remove_hollow_keys(Preferences& prefs) {
+  prefs.remove("hl_arm");
+  prefs.remove("hl_mode");
+  prefs.remove("hl_salt");
+  prefs.remove("hl_wrap");
+  prefs.remove("vpw_h_salt");
+  prefs.remove("vpw_h_wrap");
+}
+
+/** Owner opened empty Home: drop fake lock from RAM and flash. PIN/password check is gone. */
+static void lockout_disarm_hollow_lock() {
+  lockout_clear_silent_wipe_snapshot();
+  lockout_clear_vpw_prewrap_ram();
+  screen_lock_clear_pin_mode();
+  Preferences prefs;
+  prefs.begin("seedmask", false);
+  lockout_nvs_remove_hollow_keys(prefs);
+  prefs.end();
+}
+
+static void lockout_preload_vpw_hollow_from_nvs() {
+  Preferences prefs;
+  prefs.begin("seedmask", true);
+  const size_t slen = prefs.getBytesLength("vpw_h_salt");
+  const size_t wlen = prefs.getBytesLength("vpw_h_wrap");
+  if (slen != 16 || wlen < 28 || wlen > sizeof(s_hollowVpwWrap)) {
+    prefs.end();
+    return;
+  }
+  prefs.getBytes("vpw_h_salt", s_hollowVpwSalt, 16);
+  prefs.getBytes("vpw_h_wrap", s_hollowVpwWrap, wlen);
+  prefs.end();
+  s_hollowVpwWrapLen = wlen;
+  s_hollowVpwValid = true;
+}
+
+/** After reboot: restore fake lock from NVS (seed is not stored). */
+static void lockout_load_hollow_armed_from_nvs() {
+  Preferences prefs;
+  prefs.begin("seedmask", true);
+  const uint8_t armed = prefs.getUChar("hl_arm", 0);
+  if (armed == 0) {
+    prefs.end();
+    return;
+  }
+  const uint8_t mode = prefs.getUChar("hl_mode", 0);
+  const size_t slen = prefs.getBytesLength("hl_salt");
+  const size_t wlen = prefs.getBytesLength("hl_wrap");
+  if (slen != 16 || wlen < 28 || wlen > sizeof(s_lockoutSvPinWrap)) {
+    prefs.end();
+    g_lockoutSilentWipeArmed = false;
+    g_lockoutSilentNoVerify = true;
+    return;
+  }
+  prefs.getBytes("hl_salt", s_lockoutSvSalt, 16);
+  prefs.getBytes("hl_wrap", s_lockoutSvPinWrap, wlen);
+  prefs.end();
+  s_lockoutSvPinWrapLen = wlen;
+  s_lockoutSvSlMode = (mode == 1 || mode == 2) ? mode : 0;
+  g_lockoutSilentWipeArmed = true;
+  g_lockoutSilentNoVerify = false;
+  if (s_lockoutSvSlMode == 1) {
+    g_screenLockUsesPin = true;
+    g_screenLockSeparatePw = false;
+  } else if (s_lockoutSvSlMode == 2) {
+    g_screenLockUsesPin = false;
+    g_screenLockSeparatePw = true;
+  } else {
+    g_screenLockUsesPin = false;
+    g_screenLockSeparatePw = false;
+  }
+  if (s_lockoutSvSlMode == 1 || s_lockoutSvSlMode == 2) {
+    memcpy(g_pinSalt, s_lockoutSvSalt, 16);
+    g_pinWrapBlobLen = s_lockoutSvPinWrapLen;
+    memcpy(g_pinWrapBlobStore, s_lockoutSvPinWrap, s_lockoutSvPinWrapLen);
+  }
+}
+
+static bool lockout_refresh_vpw_hollow_verifier(const char* vaultPw) {
+  if (!vaultPw || !vaultPw[0]) return false;
+  if (g_screenLockUsesPin || g_screenLockSeparatePw) return false;
+  esp_fill_random(s_hollowVpwSalt, 16);
+  uint8_t key[32];
+  if (!pbkdf2_sha256((const uint8_t*)vaultPw, strlen(vaultPw), s_hollowVpwSalt, 16, PIN_PBKDF_ITERATIONS, key, sizeof(key)))
+    return false;
+  size_t plen = strlen(kHollowVpwWrapPayload) + 1;
+  size_t ctlen = sizeof(s_hollowVpwWrap);
+  if (!aes_gcm_encrypt_with_key(key, (const uint8_t*)kHollowVpwWrapPayload, plen, s_hollowVpwWrap, &ctlen)) {
+    secure_memzero(key, sizeof(key));
+    return false;
+  }
+  secure_memzero(key, sizeof(key));
+  s_hollowVpwWrapLen = ctlen;
+  s_hollowVpwValid = true;
+  Preferences prefs;
+  prefs.begin("seedmask", false);
+  prefs.putBytes("vpw_h_salt", s_hollowVpwSalt, 16);
+  prefs.putBytes("vpw_h_wrap", s_hollowVpwWrap, s_hollowVpwWrapLen);
+  prefs.end();
+  return true;
+}
+
+static bool lockout_hollow_constant_unwrap(const char* pw) {
+  if (!pw || !pw[0] || s_lockoutSvPinWrapLen < 28) return false;
+  uint8_t key[32];
+  char out[48];
+  if (!pbkdf2_sha256((const uint8_t*)pw, strlen(pw), s_lockoutSvSalt, 16, PIN_PBKDF_ITERATIONS, key, sizeof(key)))
+    return false;
+  size_t ptlen = sizeof(out);
+  bool ok = aes_gcm_decrypt_with_key(key, s_lockoutSvPinWrap, s_lockoutSvPinWrapLen, (uint8_t*)out, &ptlen);
+  secure_memzero(key, sizeof(key));
+  if (!ok || ptlen == 0 || ptlen >= sizeof(out) || out[ptlen - 1] != '\0') {
+    secure_memzero(out, sizeof(out));
+    return false;
+  }
+  const size_t expect = strlen(kHollowVpwWrapPayload) + 1;
+  const bool match = (ptlen == expect && memcmp(out, kHollowVpwWrapPayload, expect) == 0);
+  secure_memzero(out, sizeof(out));
+  return match;
+}
+
 /**
- * RAM kept across silent wipe for post-wipe unlock → HOME:
- * - PIN / separate screen lock: only sl_wrap + salt (AES-GCM ciphertext wrapping master pw — no seed vault copy).
- * - Vault-password-only lock: encrypted vault blob only (still ciphertext), fixed buffer — needed to verify vault password.
+ * RAM kept across silent wipe for post-wipe unlock → HOME (never a seed copy):
+ * - PIN / separate screen lock: sl_wrap + salt (unwraps master pw, discarded).
+ * - Vault-password-only lock: wrap of a constant derived at last lock/unlock.
  */
 static bool lockout_snapshot_secrets_for_silent_wipe() {
   lockout_clear_silent_wipe_snapshot();
@@ -9869,32 +10278,21 @@ static bool lockout_snapshot_secrets_for_silent_wipe() {
     s_lockoutSvSlMode = 2;
   else
     s_lockoutSvSlMode = 0;
-  memcpy(s_lockoutSvSalt, g_pinSalt, 16);
-  s_lockoutSvPinWrapLen = g_pinWrapBlobLen;
-  if (g_pinWrapBlobLen > sizeof(s_lockoutSvPinWrap)) return false;
-  memcpy(s_lockoutSvPinWrap, g_pinWrapBlobStore, g_pinWrapBlobLen);
 
-  if (s_lockoutSvSlMode == 1 || s_lockoutSvSlMode == 2)
-    return g_pinWrapBlobLen >= 28;
+  if (s_lockoutSvSlMode == 1 || s_lockoutSvSlMode == 2) {
+    memcpy(s_lockoutSvSalt, g_pinSalt, 16);
+    if (g_pinWrapBlobLen < 28 || g_pinWrapBlobLen > sizeof(s_lockoutSvPinWrap)) return false;
+    s_lockoutSvPinWrapLen = g_pinWrapBlobLen;
+    memcpy(s_lockoutSvPinWrap, g_pinWrapBlobStore, g_pinWrapBlobLen);
+    return true;
+  }
 
-  uint8_t* vb = nullptr;
-  size_t vl = 0;
-  if (!nvs_load_vault(&vb, vl) || vl == 0 || !vb) {
-    if (vb) {
-      secure_memzero(vb, vl);
-      free(vb);
-    }
+  if (!s_hollowVpwValid) lockout_preload_vpw_hollow_from_nvs();
+  if (!s_hollowVpwValid || s_hollowVpwWrapLen < 28 || s_hollowVpwWrapLen > sizeof(s_lockoutSvPinWrap))
     return false;
-  }
-  if (vl > LOCKOUT_SILENT_VAULT_BUF_MAX) {
-    secure_memzero(vb, vl);
-    free(vb);
-    return false;
-  }
-  memcpy(s_lockoutSvVaultBuf, vb, vl);
-  s_lockoutSvVaultLen = vl;
-  secure_memzero(vb, vl);
-  free(vb);
+  memcpy(s_lockoutSvSalt, s_hollowVpwSalt, 16);
+  s_lockoutSvPinWrapLen = s_hollowVpwWrapLen;
+  memcpy(s_lockoutSvPinWrap, s_hollowVpwWrap, s_hollowVpwWrapLen);
   return true;
 }
 
@@ -9918,7 +10316,7 @@ static bool lockout_register_failure() {
 
   if (!wantSilent) {
     lockout_clear_silent_wipe_snapshot();
-    nvs_wipe();
+    nvs_wipe(true);
     screen_lock_load_prefs();
     lockout_load_prefs();
     duress_load_all_prefs();
@@ -9928,7 +10326,9 @@ static bool lockout_register_failure() {
   }
 
   // Wipe silently ON: never use session_lock_to_home() here (would jump HOME when vault is gone).
-  nvs_wipe();
+  // NVS only here (seed gone in ~1s). SPIFFS overwrite continues in the background so the
+  // lock screen can show Wrong PIN and keep accepting tries.
+  nvs_wipe_silent_seed();
   {
     Preferences prefs;
     prefs.begin("seedmask", false);
@@ -9936,6 +10336,17 @@ static bool lockout_register_failure() {
     prefs.putUChar("lock_max_att", preserveMax);
     prefs.putUChar("lock_show_att", preserveShow ? 1u : 0u);
     prefs.putUChar("lock_fail_cnt", 0);
+    if (snapshotOk && s_lockoutSvPinWrapLen >= 28 && s_lockoutSvPinWrapLen <= sizeof(s_lockoutSvPinWrap)) {
+      prefs.putUChar("hl_arm", 1);
+      prefs.putUChar("hl_mode", s_lockoutSvSlMode);
+      prefs.putBytes("hl_salt", s_lockoutSvSalt, 16);
+      prefs.putBytes("hl_wrap", s_lockoutSvPinWrap, s_lockoutSvPinWrapLen);
+      if (s_lockoutSvSlMode == 1 || s_lockoutSvSlMode == 2) {
+        prefs.putUChar("sl_pin", s_lockoutSvSlMode);
+        prefs.putBytes("sl_salt", s_lockoutSvSalt, 16);
+        prefs.putBytes("sl_wrap", s_lockoutSvPinWrap, s_lockoutSvPinWrapLen);
+      }
+    }
     prefs.end();
   }
   screen_lock_load_prefs();
@@ -9944,8 +10355,16 @@ static bool lockout_register_failure() {
   g_hasVault = false;
   g_lockoutSilentWipeArmed = snapshotOk;
   g_lockoutSilentNoVerify = !snapshotOk;
+  if (snapshotOk && (s_lockoutSvSlMode == 1 || s_lockoutSvSlMode == 2)) {
+    memcpy(g_pinSalt, s_lockoutSvSalt, 16);
+    g_pinWrapBlobLen = s_lockoutSvPinWrapLen;
+    memcpy(g_pinWrapBlobStore, s_lockoutSvPinWrap, s_lockoutSvPinWrapLen);
+    g_screenLockUsesPin = (s_lockoutSvSlMode == 1);
+    g_screenLockSeparatePw = (s_lockoutSvSlMode == 2);
+  }
   session_stay_on_locked_after_silent_wipe();
-  return true;
+  nvs_wipe_start_spiffs_bg();
+  return false;
 }
 
 // Stateful only: save passwords+notes to NVS (encrypted with master password). Uses session key cache to avoid PBKDF2 on every save.
@@ -9959,8 +10378,39 @@ static bool session_can_persist_vault_data() {
   return g_masterPw[0] != 0;
 }
 
+/** User never chose a vault/backup password (onboard used a device-internal key). */
+static bool session_needs_user_vault_password_for_pm() {
+  if (decoy_vault_persist_active()) return false;
+  if (g_portableBackupReady) return false;
+  if (pwSvc_getCount() > 0 || g_noteCount > 0 || g_totpCount > 0) return false;
+  return true;
+}
+
+/** If ADD must collect a user password first, open that screen and return true. */
+static bool pw_notes_tfa_prompt_vault_password_if_needed(UIScreen returnTo) {
+  if (!session_needs_user_vault_password_for_pm()) return false;
+  g_createVaultPasswordThenAdd = true;
+  g_vaultPwThenAddReturn = returnTo;
+  g_creatingMasterPassword = false;
+  g_createBackupFromSeedSettings = false;
+  clearPassword(g_password1);
+  clearPassword(g_password2);
+  g_pwMasked = true;
+  setMsg("Min 12 chars, A-Z, digit, symbol.");
+  show(UIScreen::CREATE_PASSWORD);
+  return true;
+}
+
 static bool session_persist_vault_requires_sd() {
   return !decoy_vault_persist_active();
+}
+
+/** Real vault writes need a card. Sets Insert microSD to save and returns false when missing. */
+static bool vault_require_sd_for_pm_save() {
+  if (!session_persist_vault_requires_sd()) return true;
+  if (sd_ready()) return true;
+  setMsg("Insert microSD to save");
+  return false;
 }
 
 /** Persist passwords/notes to NVS; SD first when required for the real vault. */
@@ -10950,7 +11400,7 @@ static void handleSdSavePathPickerTap(uint16_t x, uint16_t y) {
 
 static bool backup_code_save_to_sd(const char* backupCode, const char* password, const char seedWords[][16], uint8_t wc) {
   Serial.println("backup_code_save_to_sd: Starting backup code save...");
-  if (!backupCode || !password || strlen(password) < 4) {
+  if (!backupCode || !password || strlen(password) < BACKUP_PASSWORD_MIN_LEN) {
     Serial.println("backup_code_save_to_sd: Invalid inputs");
     return false;
   }
@@ -11153,17 +11603,8 @@ static bool backup_code_save_to_sd(const char* backupCode, const char* password,
   Serial.println(success ? "SUCCESSFUL" : "FAILED");
 
   if (success) {
-    // Extract just the filename from the full path
-    const char* filename = strrchr(BC_FILE, '/');
-    if (filename) {
-      filename++;  // Skip the '/'
-    } else {
-      filename = BC_FILE;
-    }
-
-    // Show success message with filename
     char successMsg[128];
-    snprintf(successMsg, sizeof(successMsg), "Backup saved as: %s", filename);
+    snprintf(successMsg, sizeof(successMsg), "Backup saved as: %s", backup_code_sd_basename());
     setMsg(successMsg);
     Serial.print("backup_code_save_to_sd: Success message: ");
     Serial.println(successMsg);
@@ -11174,7 +11615,7 @@ static bool backup_code_save_to_sd(const char* backupCode, const char* password,
 
 static bool backup_code_load_from_sd(const char* password, char* outCode, size_t outCodeLen, const char* filePathOverride = nullptr) {
   Serial.println("backup_code_load_from_sd: Starting backup code load...");
-  if (!password || strlen(password) < 4 || !outCode) {
+  if (!password || strlen(password) < BACKUP_PASSWORD_MIN_LEN || !outCode) {
     Serial.println("backup_code_load_from_sd: Invalid inputs");
     return false;
   }
@@ -12036,6 +12477,7 @@ static const Rect BTN_ENTROPY_HW = { 16, 72, 288, 128 };
 static const Rect BTN_ENTROPY_DICE = { 16, 220, 288, 128 };
 static const Rect HIT_ENTROPY_HW = { 16, 72, 288, 128 };
 static const Rect HIT_ENTROPY_DICE = { 16, 220, 288, 128 };
+static const Rect BTN_ENTROPY_HW_CONTINUE = { 20, 348, 280, 52 };
 static const Rect BTN_ENTROPY_BACK = { 40, 320, 240, 50 };  // unused (Back removed; swipe-back)
 
 static const Rect BTN_DICE_WORDS_12 = { 20, 120, 280, 70 };
@@ -14375,6 +14817,7 @@ static void drawNoteBodyScreen() {
 
   drawKeyboard();
   // No BACK button here; use swipe or on-screen actions to exit
+  if (g_msg[0]) menu_draw_message_card_overlay();
   ui_flush();
 }
 
@@ -15144,6 +15587,9 @@ static void drawEditor(const char* title, const char* hint) {
     drawBtn(Rect{ popupX + 20, popupY + 82, 100, 44 }, "Yes", RGB565_RED, 2);
     drawBtn(Rect{ popupX + 140, popupY + 82, 100, 44 }, "Cancel", RGB565_DARKGREY, 2);
   }
+  if (g_msg[0] && !g_pwEditExitPrompt && !g_showPwGenerateConfirm && !g_pwShowFullPopup)
+    menu_draw_message_card_overlay();
+
   if (g_pwEditExitPrompt) {
     const int popupW = 282, popupH = 148, popupR = 12;
     const int popupX = (LCD_W - popupW) / 2, popupY = (LCD_H - popupH) / 2;
@@ -15479,6 +15925,10 @@ static void handleEditorTap(uint16_t x, uint16_t y) {
           draw();
           return;
         }
+        if (!vault_require_sd_for_pm_save()) {
+          draw();
+          return;
+        }
         if (!vault_commit_passwords_notes_persist()) {
           if (g_sdSavePathPickOpen) return;
           draw();
@@ -15493,10 +15943,11 @@ static void handleEditorTap(uint16_t x, uint16_t y) {
         g_noteItems[g_viewNoteIndex].title[sizeof(g_noteItems[0].title) - 1] = 0;
         edit_set(g_noteItems[g_viewNoteIndex].body);
         g_vaultQrDirty = true;
-        if (session_can_persist_vault_data()) {
-          if (session_persist_vault_requires_sd() && sd_ready() && g_masterPw[0])
-            (void)pw_vault_save_to_sd(g_masterPw);
-          save_passwords_notes_to_nvs();
+        if (!vault_commit_passwords_notes_persist()) {
+          if (g_sdSavePathPickOpen) return;
+          if (!g_msg[0]) setMsg("Insert microSD to save");
+          draw();
+          return;
         }
         memset(g_tmpTitle, 0, sizeof(g_tmpTitle));
         exitEditor();
@@ -15538,20 +15989,22 @@ static void handleEditorTap(uint16_t x, uint16_t y) {
         pwSvc_setTitle(g_viewPwIndex, titleMeta);
         edit_set(pwSvc_getValueCStr(g_viewPwIndex));
         g_vaultQrDirty = true;
-        if (session_can_persist_vault_data()) {
-          if (session_persist_vault_requires_sd() && sd_ready() && g_masterPw[0])
-            (void)pw_vault_save_to_sd(g_masterPw);
-          save_passwords_notes_to_nvs();
+        if (!vault_commit_passwords_notes_persist()) {
+          if (g_sdSavePathPickOpen) return;
+          if (!g_msg[0]) setMsg("Insert microSD to save");
+          draw();
+          return;
         }
       } else if (g_editMode == EditMode::EDIT_NOTE_BODY && g_viewNoteIndex < g_noteCount) {
         strncpy(g_noteItems[g_viewNoteIndex].title, g_tmpTitle, sizeof(g_noteItems[0].title) - 1);
         g_noteItems[g_viewNoteIndex].title[sizeof(g_noteItems[0].title) - 1] = 0;
         edit_set(g_noteItems[g_viewNoteIndex].body);
         g_vaultQrDirty = true;
-        if (session_can_persist_vault_data()) {
-          if (session_persist_vault_requires_sd() && sd_ready() && g_masterPw[0])
-            (void)pw_vault_save_to_sd(g_masterPw);
-          save_passwords_notes_to_nvs();
+        if (!vault_commit_passwords_notes_persist()) {
+          if (g_sdSavePathPickOpen) return;
+          if (!g_msg[0]) setMsg("Insert microSD to save");
+          draw();
+          return;
         }
       }
       // intentionally fall through (no return)
@@ -16133,8 +16586,6 @@ static void handleEditorTap(uint16_t x, uint16_t y) {
 
     // VALUE -> SAVE (new password)
     if (g_editMode == EditMode::ADD_PW_VALUE) {
-      setMsg("Saving...");
-      draw();
       if (!g_tmpTitle[0] && !g_tmpUser[0]) {
         setMsg("Need name or username");
         draw();
@@ -16155,6 +16606,13 @@ static void handleEditorTap(uint16_t x, uint16_t y) {
         draw();
         return;
       }
+      if (!vault_require_sd_for_pm_save()) {
+        draw();
+        return;
+      }
+
+      setMsg("Saving...");
+      draw();
 
       char titleMeta[sizeof(PwItem::title)];
       composePasswordTitleMeta(g_tmpTitle, g_tmpUser, g_tmpWebsite, g_tmpPwNotes, titleMeta, sizeof(titleMeta));
@@ -16171,7 +16629,9 @@ static void handleEditorTap(uint16_t x, uint16_t y) {
       g_vaultQrDirty = true;
 
       if (!vault_commit_passwords_notes_persist()) {
+        pwSvc_removeLast();
         if (g_sdSavePathPickOpen) return;
+        if (!g_msg[0]) setMsg("Insert microSD to save");
         draw();
         return;
       }
@@ -16210,14 +16670,29 @@ static void handleEditorTap(uint16_t x, uint16_t y) {
         draw();
         return;
       }
+      if (!session_can_persist_vault_data()) {
+        setMsg("No password in session");
+        draw();
+        return;
+      }
+      if (!vault_require_sd_for_pm_save()) {
+        draw();
+        return;
+      }
       strncpy(g_noteItems[g_noteCount].title, g_tmpTitle, sizeof(g_noteItems[0].title) - 1);
       g_noteItems[g_noteCount].title[sizeof(g_noteItems[0].title) - 1] = 0;
       strncpy(g_noteItems[g_noteCount].body, g_editBuf, sizeof(g_noteItems[0].body) - 1);
       g_noteItems[g_noteCount].body[sizeof(g_noteItems[0].body) - 1] = 0;
       g_noteCount++;
       g_vaultQrDirty = true;
-      if (sd_ready() && g_masterPw[0]) pw_vault_save_to_sd(g_masterPw);
-      save_passwords_notes_to_nvs();
+      if (!vault_commit_passwords_notes_persist()) {
+        g_noteCount--;
+        memset(&g_noteItems[g_noteCount], 0, sizeof(g_noteItems[0]));
+        if (g_sdSavePathPickOpen) return;
+        if (!g_msg[0]) setMsg("Insert microSD to save");
+        draw();
+        return;
+      }
       memset(g_tmpTitle, 0, sizeof(g_tmpTitle));
       exitEditor();
       triggerListCountFlash(UIScreen::NOTES);
@@ -16233,11 +16708,24 @@ static void handleEditorTap(uint16_t x, uint16_t y) {
         return;
       }
       if (g_viewNoteIndex < g_noteCount) {
+        if (!session_can_persist_vault_data()) {
+          setMsg("No password in session");
+          draw();
+          return;
+        }
+        if (!vault_require_sd_for_pm_save()) {
+          draw();
+          return;
+        }
         strncpy(g_noteItems[g_viewNoteIndex].body, g_editBuf, sizeof(g_noteItems[0].body) - 1);
         g_noteItems[g_viewNoteIndex].body[sizeof(g_noteItems[0].body) - 1] = 0;
         g_vaultQrDirty = true;
-        if (sd_ready() && g_masterPw[0]) pw_vault_save_to_sd(g_masterPw);
-        save_passwords_notes_to_nvs();
+        if (!vault_commit_passwords_notes_persist()) {
+          if (g_sdSavePathPickOpen) return;
+          if (!g_msg[0]) setMsg("Insert microSD to save");
+          draw();
+          return;
+        }
       }
       exitEditor();
       show(UIScreen::NOTES);
@@ -17126,8 +17614,6 @@ static void drawPasswords() {
   drawSwipeBackHintOverlay();
   ui_flush();
 }
-
-static const int NOTE_ROW_H = 40;
 
 // Notes grid (Samsung-style): body preview inside a tile, title caption underneath.
 // Uses g_noteListScroll as the first visible note index (aligned to 2-column rows).
@@ -18355,6 +18841,10 @@ static bool pwEditSaveAndExit() {
     draw();
     return false;
   }
+  if (!vault_require_sd_for_pm_save()) {
+    draw();
+    return false;
+  }
   if (!g_tmpTitle[0] && !g_tmpUser[0]) {
     setMsg("Need name or username");
     draw();
@@ -18961,6 +19451,7 @@ static void drawTfaAdd() {
     gfx->print("QR");
   }
   drawKeyboard();
+  if (g_msg[0]) menu_draw_message_card_overlay();
   ui_flush();
 }
 
@@ -18988,6 +19479,15 @@ static void tfaAddTryCommit() {
     draw();
     return;
   }
+  if (!session_can_persist_vault_data()) {
+    setMsg("No password in session");
+    draw();
+    return;
+  }
+  if (!vault_require_sd_for_pm_save()) {
+    draw();
+    return;
+  }
   uint8_t dst = g_tfaEditMode ? g_tfaEditIndex : g_totpCount;
   stripCharInPlace(g_tfaAddLabel, ':');  // account must use dedicated field (no "name:account" in name)
   if (g_tfaAddAccount[0]) {
@@ -19000,8 +19500,16 @@ static void tfaAddTryCommit() {
   g_totpItems[dst].secret[sizeof(g_totpItems[0].secret) - 1] = 0;
   if (!g_tfaEditMode) g_totpCount++;
   g_vaultQrDirty = true;
-  save_passwords_notes_to_nvs();
-  if (sd_ready() && g_masterPw[0]) pw_vault_save_to_sd(g_masterPw);
+  if (!vault_commit_passwords_notes_persist()) {
+    if (!g_tfaEditMode) {
+      g_totpCount--;
+      memset(&g_totpItems[g_totpCount], 0, sizeof(g_totpItems[0]));
+    }
+    if (g_sdSavePathPickOpen) return;
+    if (!g_msg[0]) setMsg("Insert microSD to save");
+    draw();
+    return;
+  }
   g_tfaAddLabel[0] = 0;
   g_tfaAddAccount[0] = 0;
   g_tfaAddSecret[0] = 0;
@@ -19025,6 +19533,7 @@ static void tfaAddTryCommit() {
 static void handleTfaListTap(uint16_t x, uint16_t y) {
   // No BACK button here; use swipe or MENU/HOME navigation
   if (hitBottomListAction(BTN_TFA_ADD, x, y) && !nav_bar_home_tap_hit((int16_t)x, (int16_t)y)) {
+    if (pw_notes_tfa_prompt_vault_password_if_needed(UIScreen::TFA_LIST)) return;
     if (g_totpCount >= MAX_TOTP_ITEMS) {
       setMsg("2FA list full.");
       draw();
@@ -21465,6 +21974,7 @@ static void restorePayload_add(char c) {
   if (!g_restorePayload) return;
   if (c >= 'a' && c <= 'z') c = (char)(c - 'a' + 'A');
   if (!((c >= 'A' && c <= 'Z') || (c >= '2' && c <= '7'))) return;
+  if (!g_restorePayloadIsSpf1 && strlen(g_restorePayload) >= BACKUP_SPB1_PAYLOAD_24) return;
   appendChar(g_restorePayload, RESTORE_PAYLOAD_MAX, c);
 }
 static void restorePayload_buildFull() {
@@ -21566,10 +22076,7 @@ static bool make_backup_code_from_seed(const char seedWords[][16], uint8_t wc,
                                        const char* password,
                                        char* outCode, size_t outCodeLen,
                                        bool alsoStoreNVS) {
-  if (!password || strlen(password) < 4) {
-    setMsg("Password too short.");
-    return false;
-  }
+  if (!backup_password_ok_for_create(password)) return false;
   if (!(wc == 12 || wc == 24)) return false;
 
   uint16_t idx[24];
@@ -21590,22 +22097,26 @@ static bool make_backup_code_from_seed(const char seedWords[][16], uint8_t wc,
   esp_fill_random(salt, sizeof(salt));
 
   uint8_t key[32];
-  if (!pbkdf2_sha256((const uint8_t*)password, strlen(password), salt, sizeof(salt), PBKDF2_ITERATIONS, key, sizeof(key))) {
+  if (!pbkdf2_sha256((const uint8_t*)password, strlen(password), salt, sizeof(salt), BACKUP_PBKDF2_ITERATIONS, key, sizeof(key))) {
     setMsg("PBKDF2 failed.");
     return false;
   }
 
-  // Use XOR encryption for backup codes (shorter) - AES-GCM for vault storage only
+  // XOR + 4-byte HMAC for the portable code. On-device vault stays AES-GCM (10k KDF).
   uint8_t ct[33];
   memcpy(ct, seedPacked, seedBytesLen);
   xor_keystream(key, ct, seedBytesLen);
 
-  Serial.print("make_backup_code_from_seed: XOR encrypted ");
-  Serial.print(seedBytesLen);
-  Serial.println(" bytes");
+  uint8_t ver = BACKUP_SPB1_VERSION;
+  uint8_t mac[BACKUP_SPB1_MAC_LEN];
+  if (!backup_spb1_mac4(key, ver, wc, salt, ct, seedBytesLen, mac)) {
+    secure_memzero(key, sizeof(key));
+    setMsg("HMAC failed.");
+    return false;
+  }
+  secure_memzero(key, sizeof(key));
 
-  uint8_t ver = 1;
-  uint8_t hdr[2 + 4 + 33 + 2];  // XOR format: version + wc + salt + ciphertext(17 or 33) + crc
+  uint8_t hdr[2 + 4 + 33 + BACKUP_SPB1_MAC_LEN];
   size_t p = 0;
   hdr[p++] = ver;
   hdr[p++] = wc;
@@ -21613,10 +22124,8 @@ static bool make_backup_code_from_seed(const char seedWords[][16], uint8_t wc,
   p += 4;
   memcpy(hdr + p, ct, seedBytesLen);
   p += seedBytesLen;
-
-  uint16_t crc = crc16_ccitt(hdr, p);
-  hdr[p++] = (crc >> 8) & 0xFF;
-  hdr[p++] = (crc >> 0) & 0xFF;
+  memcpy(hdr + p, mac, BACKUP_SPB1_MAC_LEN);
+  p += BACKUP_SPB1_MAC_LEN;
 
   String payload = base32_encode(hdr, p);
   String code = String("SPB1-") + group4(payload);
@@ -21629,7 +22138,26 @@ static bool make_backup_code_from_seed(const char seedWords[][16], uint8_t wc,
   outCode[outCodeLen - 1] = 0;
 
   if (alsoStoreNVS && !g_duressSession) {
-    if (!nvs_save_vault(hdr, p)) {
+    uint8_t nvsSalt[4];
+    esp_fill_random(nvsSalt, sizeof(nvsSalt));
+    uint8_t nvsCt[65];
+    size_t nvsCtLen = sizeof(nvsCt);
+    if (!aes_gcm_encrypt(password, nvsSalt, seedPacked, seedBytesLen, nvsCt, &nvsCtLen)) {
+      setMsg("NVS save failed.");
+      return false;
+    }
+    uint8_t nvsHdr[2 + 4 + 65 + 2];
+    size_t np = 0;
+    nvsHdr[np++] = 1;
+    nvsHdr[np++] = wc;
+    memcpy(nvsHdr + np, nvsSalt, 4);
+    np += 4;
+    memcpy(nvsHdr + np, nvsCt, nvsCtLen);
+    np += nvsCtLen;
+    uint16_t nvsCrc = crc16_ccitt(nvsHdr, np);
+    nvsHdr[np++] = (uint16_t)((nvsCrc >> 8) & 0xFF);
+    nvsHdr[np++] = (uint16_t)(nvsCrc & 0xFF);
+    if (!nvs_save_vault(nvsHdr, np)) {
       setMsg("NVS save failed.");
       return false;
     }
@@ -21873,6 +22401,10 @@ static bool restore_seed_from_backup_code(const char* codeWithPrefix,
     setMsg("Code must start SPB1- or SPF1-");
     return false;
   }
+  if (strlen(password) < BACKUP_PASSWORD_MIN_LEN) {
+    setMsg("Use at least 12 characters.");
+    return false;
+  }
   const char* src = s + 5;
   char* dst = s_restore_payloadBuf;
   size_t cap = sizeof(s_restore_payloadBuf) - 1;
@@ -21918,21 +22450,27 @@ static bool restore_seed_from_backup_code(const char* codeWithPrefix,
     Serial.print(buf[2 + i], HEX);
   }
   Serial.print(", data_len=");
-  Serial.println(blen - 6 - 2);  // Exclude version, wc, salt, crc
+  Serial.println(blen > 10 ? (blen - 10) : 0);
 #endif
 
-  uint16_t got = ((uint16_t)buf[blen - 2] << 8) | buf[blen - 1];
-  uint16_t calc = crc16_ccitt(buf, blen - 2);
-  if (got != calc) {
+  if (blen < 8) {
     secure_memzero(buf, maxOut);
     free(buf);
-    setMsg("CRC mismatch");
+    setMsg("Invalid backup code");
+    return false;
+  }
+
+  // v1 XOR+CRC codes are not restored.
+  if (blen == (size_t)(1 + 1 + 4 + 17 + 2) || blen == (size_t)(1 + 1 + 4 + 33 + 2)) {
+    secure_memzero(buf, maxOut);
+    free(buf);
+    setMsg("This backup format is no longer supported.");
     return false;
   }
 
   uint8_t ver = buf[0];
   uint8_t wc = buf[1];
-  if (ver != 1 || !(wc == 12 || wc == 24)) {
+  if (!(wc == 12 || wc == 24)) {
     secure_memzero(buf, maxOut);
     free(buf);
     setMsg("Bad version");
@@ -21940,32 +22478,53 @@ static bool restore_seed_from_backup_code(const char* codeWithPrefix,
   }
 
   size_t seedBytesLen = packed_len_for_words(wc);
-  // Support both XOR (backup codes) and AES-GCM (vault storage) formats
-  if (blen == (size_t)(1 + 1 + 4 + seedBytesLen + 2)) {
-    // XOR format - backup codes (shorter). Use static buffers to reduce loop task stack.
+  size_t xorHmacLen = (size_t)(1 + 1 + 4 + seedBytesLen + BACKUP_SPB1_MAC_LEN);
+  if (blen == xorHmacLen) {
+    if (ver != BACKUP_SPB1_VERSION) {
+      secure_memzero(buf, maxOut);
+      free(buf);
+      setMsg("Bad version");
+      return false;
+    }
 #if SEEDMASK_CRYPTO_DEBUG
-    Serial.println("restore_seed_from_backup_code: Detected XOR format (backup code)");
+    Serial.println("restore_seed_from_backup_code: Detected XOR+HMAC backup code");
 #endif
     static uint8_t s_restore_ct[33];
     static uint8_t s_restore_key[32];
     static uint16_t s_restore_idx[24];
     static uint8_t s_restore_newSalt[4];
     static uint8_t s_restore_newSeedPacked[33];
-    static uint8_t s_restore_newCt[65];               // 12+33+16 for 24-word AES-GCM
-    static uint8_t s_restore_newHdr[2 + 4 + 61 + 2];  // ver+wc+salt+ct+crc for 24-word
+    static uint8_t s_restore_newCt[65];
+    static uint8_t s_restore_newHdr[2 + 4 + 61 + 2];
+    static uint8_t s_restore_mac[BACKUP_SPB1_MAC_LEN];
+    static uint8_t s_restore_got_mac[BACKUP_SPB1_MAC_LEN];
 
     memcpy(s_restore_ct, buf + 6, seedBytesLen);
-    if (!pbkdf2_sha256((const uint8_t*)password, strlen(password), buf + 2, 4, PBKDF2_ITERATIONS, s_restore_key, 32)) {
+    memcpy(s_restore_got_mac, buf + 6 + seedBytesLen, BACKUP_SPB1_MAC_LEN);
+    if (!pbkdf2_sha256((const uint8_t*)password, strlen(password), buf + 2, 4, BACKUP_PBKDF2_ITERATIONS, s_restore_key, 32)) {
       secure_memzero(s_restore_ct, sizeof(s_restore_ct));
       secure_memzero(buf, maxOut);
       free(buf);
       setMsg("PBKDF2 failed");
       return false;
     }
+    if (!backup_spb1_mac4(s_restore_key, ver, wc, buf + 2, s_restore_ct, seedBytesLen, s_restore_mac) ||
+        !backup_mac4_eq(s_restore_mac, s_restore_got_mac)) {
+      secure_memzero(s_restore_key, sizeof(s_restore_key));
+      secure_memzero(s_restore_ct, sizeof(s_restore_ct));
+      secure_memzero(s_restore_mac, sizeof(s_restore_mac));
+      secure_memzero(s_restore_got_mac, sizeof(s_restore_got_mac));
+      secure_memzero(buf, maxOut);
+      free(buf);
+      setMsg("Wrong password or code");
+      return false;
+    }
     xor_keystream(s_restore_key, s_restore_ct, seedBytesLen);
     unpack_seed_indices(s_restore_ct, wc, s_restore_idx);
     secure_memzero(s_restore_key, sizeof(s_restore_key));
     secure_memzero(s_restore_ct, sizeof(s_restore_ct));
+    secure_memzero(s_restore_mac, sizeof(s_restore_mac));
+    secure_memzero(s_restore_got_mac, sizeof(s_restore_got_mac));
 
     for (int i = 0; i < wc; i++) {
       if (s_restore_idx[i] >= BIP39_WORD_COUNT) {
@@ -22052,6 +22611,20 @@ static bool restore_seed_from_backup_code(const char* codeWithPrefix,
     return true;
 
   } else if (blen == (size_t)(1 + 1 + 4 + 45 + 2) || blen == (size_t)(1 + 1 + 4 + 61 + 2)) {
+    if (ver != 1) {
+      secure_memzero(buf, maxOut);
+      free(buf);
+      setMsg("Bad version");
+      return false;
+    }
+    uint16_t got = ((uint16_t)buf[blen - 2] << 8) | buf[blen - 1];
+    uint16_t calc = crc16_ccitt(buf, blen - 2);
+    if (got != calc) {
+      secure_memzero(buf, maxOut);
+      free(buf);
+      setMsg("Wrong password or code");
+      return false;
+    }
     // AES-GCM format - vault storage (12-word: 45-byte ct, 24-word: 61-byte ct). Use static buffers to reduce stack.
     size_t aesCtLen = blen - 2 - 4 - 2;  // ver+wc + salt + ct + crc
 #if SEEDMASK_CRYPTO_DEBUG
@@ -27228,10 +27801,63 @@ static void drawCreateEntropyMethod() {
   gfx->print("How should randomness be created?");
 
   drawEntropyOptionCard(BTN_ENTROPY_HW, "Standard", "Hardware entropy",
-                        "Built-in device TRNG - fast & private", true, true);
+                        "Built-in device TRNG - fast & private", true, false);
   drawEntropyOptionCard(BTN_ENTROPY_DICE, "Dice roll", "Secure entropy",
-                        "You roll physical dice - verifiable", false, false);
+                        "You roll physical dice - verifiable", false, true);
 
+  ui_flush();
+}
+
+static void drawCreateEntropyHwWarn() {
+  gfx->fillScreen(RGB565_BLACK);
+  drawTopBar("Standard");
+
+  gfx->setTextSize(2);
+  gfx->setTextWrap(false);
+  int y = 56;
+  gfx->setTextColor(UI_TEXT);
+  gfx->setCursor(16, y);
+  gfx->print("This source is not");
+  y += 22;
+  gfx->setCursor(16, y);
+  gfx->print("proven.");
+  y += 28;
+  gfx->setTextColor(RGB565(170, 170, 178));
+  gfx->setCursor(16, y);
+  gfx->print("Standard uses ADC +");
+  y += 22;
+  gfx->setCursor(16, y);
+  gfx->print("TRNG only. It is meant");
+  y += 22;
+  gfx->setCursor(16, y);
+  gfx->print("to give 128 bits");
+  y += 22;
+  gfx->setCursor(16, y);
+  gfx->print("(12 words) or 256 bits");
+  y += 22;
+  gfx->setCursor(16, y);
+  gfx->print("(24 words), but that");
+  y += 22;
+  gfx->setCursor(16, y);
+  gfx->print("has not been measured.");
+  y += 28;
+  gfx->setTextColor(UI_ACCENT);
+  gfx->setCursor(16, y);
+  gfx->print("Dice roll is the");
+  y += 22;
+  gfx->setCursor(16, y);
+  gfx->print("verifiable path.");
+
+  drawGradientSilverButton(BTN_ENTROPY_HW_CONTINUE, "Continue anyway", 2);
+
+  const char* hint = "Swipe back to choose Dice roll";
+  gfx->setTextSize(1);
+  gfx->setTextColor(RGB565_DARKGREY);
+  int tw = (int)strlen(hint) * 6;
+  int tx = (LCD_W - tw) / 2;
+  if (tx < 10) tx = 10;
+  gfx->setCursor(tx, BTN_ENTROPY_HW_CONTINUE.y + BTN_ENTROPY_HW_CONTINUE.h + 16);
+  gfx->print(hint);
   ui_flush();
 }
 
@@ -28317,6 +28943,189 @@ static bool password_is_common_derived_weak(const char* pw) {
   return false;
 }
 
+// Common chunks we always treat as "a dumped password" (min 5). Includes mycat.
+static const char* const kBackupPasswordClicheRuns[] = {
+  "1234567890",
+  "123456789",
+  "password12",
+  "password1",
+  "1q2w3e4r",
+  "zaq1zaq1",
+  "iloveyou",
+  "admin123",
+  "trustno1",
+  "passwort",
+  "passw0rd",
+  "password",
+  "qwertyui",
+  "asdfghjk",
+  "zxcvbnm",
+  "12345678",
+  "letmein",
+  "qwerty",
+  "qwertz",
+  "asdfgh",
+  "zxcvbn",
+  "qazwsx",
+  "abc123",
+  "123456",
+  "111111",
+  "000000",
+  "654321",
+  "123123",
+  "welcome",
+  "12345",
+  "mycat",
+};
+
+static bool backup_char_is_symbol(unsigned char c) {
+  return !isalnum(c) && !isspace(c);
+}
+
+static uint32_t backup_fnv1a32_n(const char* s, size_t n) {
+  uint32_t h = 0x811C9DC5u;
+  for (size_t i = 0; i < n; i++) {
+    h ^= (uint32_t)(unsigned char)s[i];
+    h *= 0x01000193u;
+  }
+  return h;
+}
+
+static bool backup_alnum_is_common_chunk(const char* s, size_t len) {
+  if (len < 5 || len > 20 || !s) return false;
+  for (size_t i = 0; i < sizeof(kBackupPasswordClicheRuns) / sizeof(kBackupPasswordClicheRuns[0]); i++) {
+    if (strlen(kBackupPasswordClicheRuns[i]) == len && memcmp(s, kBackupPasswordClicheRuns[i], len) == 0) return true;
+  }
+  if (len < 6) return false;
+  return password_is_common_hash(backup_fnv1a32_n(s, len));
+}
+
+static bool backup_find_longest_common_chunk(const char* s, size_t* outPos, size_t* outLen) {
+  if (!s || !s[0]) return false;
+  size_t n = strlen(s);
+  size_t bestPos = 0, bestLen = 0;
+  for (size_t i = 0; i < n; i++) {
+    size_t maxL = n - i;
+    if (maxL > 20) maxL = 20;
+    for (size_t L = maxL; L >= 5; L--) {
+      if (L <= bestLen) break;
+      if (backup_alnum_is_common_chunk(s + i, L)) {
+        bestLen = L;
+        bestPos = i;
+        break;
+      }
+    }
+  }
+  if (bestLen < 5) return false;
+  if (outPos) *outPos = bestPos;
+  if (outLen) *outLen = bestLen;
+  return true;
+}
+
+// After removing a common password, peel this/is/my/from/the… Only leftover real words count.
+static size_t backup_unique_phrase_letters(const char* rem) {
+  if (!rem) return 0;
+  size_t extra = 0;
+  size_t uniq = 0;
+  bool seen[26] = {};
+  size_t i = 0;
+  while (rem[i]) {
+    if (!isalpha((unsigned char)rem[i])) {
+      i++;
+      continue;
+    }
+    size_t j = i;
+    while (rem[j] && isalpha((unsigned char)rem[j])) j++;
+    size_t a = i;
+    while (a < j) {
+      size_t maxL = j - a;
+      if (maxL > 12) maxL = 12;
+      size_t peel = 0;
+      char w[16];
+      for (size_t L = maxL; L >= 2; L--) {
+        memcpy(w, rem + a, L);
+        w[L] = 0;
+        if (password_hf_english_dict_contains(w)) {
+          peel = L;
+          break;
+        }
+      }
+      if (peel) {
+        a += peel;
+        continue;
+      }
+      extra += (j - a);
+      for (size_t k = a; k < j; k++) {
+        int idx = (int)(rem[k] - 'a');
+        if (idx >= 0 && idx < 26 && !seen[idx]) {
+          seen[idx] = true;
+          uniq++;
+        }
+      }
+      break;
+    }
+    i = j;
+  }
+  if (uniq <= 2) return 0;
+  return extra;
+}
+
+// True = too common (sticker on a dump, or two dumps glued).
+static bool backup_password_is_dressed_common(const char* password) {
+  if (!password || !password[0]) return false;
+  char compact[128];
+  password_to_folded_compact_alnum(password, compact, sizeof(compact));
+  if (!compact[0]) return false;
+
+  int hits = 0;
+  for (int guard = 0; guard < 8; guard++) {
+    size_t pos = 0, len = 0;
+    if (!backup_find_longest_common_chunk(compact, &pos, &len)) break;
+    hits++;
+    if (hits >= 2) return true;
+    memmove(compact + pos, compact + pos + len, strlen(compact + pos + len) + 1);
+  }
+  if (hits == 0) return false;
+  return backup_unique_phrase_letters(compact) < 6;
+}
+
+static bool backup_password_ok_for_create(const char* password) {
+  if (!password) {
+    setMsg("Use at least 12 characters.");
+    return false;
+  }
+  size_t n = strlen(password);
+  if (n < BACKUP_PASSWORD_MIN_LEN) {
+    setMsg("Use at least 12 characters.");
+    return false;
+  }
+  bool haveUpper = false, haveDigit = false, haveSymbol = false;
+  for (size_t i = 0; i < n; i++) {
+    unsigned char c = (unsigned char)password[i];
+    if (isupper(c)) haveUpper = true;
+    else if (isdigit(c)) haveDigit = true;
+    else if (backup_char_is_symbol(c)) haveSymbol = true;
+  }
+  if (!haveUpper) {
+    setMsg("Need an uppercase letter.");
+    return false;
+  }
+  if (!haveDigit) {
+    setMsg("Need a digit.");
+    return false;
+  }
+  if (!haveSymbol) {
+    setMsg("Need a symbol.");
+    return false;
+  }
+  if (password_is_top_common_password(password) || password_is_common_derived_weak(password)
+      || backup_password_is_dressed_common(password)) {
+    setMsg("Too common. Pick another.");
+    return false;
+  }
+  return true;
+}
+
 // Catch user-style "common phrase + simple suffix" passwords:
 // examples: ilovemycat123, ilovemycat1990.
 // Intentionally does NOT fire for longer mixed strings with substantial extra words/content.
@@ -29118,12 +29927,83 @@ static void drawPasswordStrengthBar(int x, int y, int w, uint8_t score) {
   gfx->print(label);
 }
 
+static void drawPasswordCreateHintCard(const char* hint) {
+  if (!hint || !hint[0]) return;
+  const int ts = 1;
+  const int cw = 6 * ts;
+  const int lh = 12;
+  const int padX = 16;
+  const int padY = 12;
+  const int stripeW = 3;
+  const int stripeGap = 10;
+  const int cardX = 12;
+  const int cardW = LCD_W - 24;
+  const int cardY = 52;
+  int maxChars = (cardW - padX - padX - stripeW - stripeGap) / cw;
+  if (maxChars < 16) maxChars = 16;
+  if (maxChars > 55) maxChars = 55;
+
+  char lines[5][56];
+  int nLines = 0;
+  const char* p = hint;
+  while (*p && nLines < 5) {
+    while (*p == ' ') p++;
+    if (!*p) break;
+    size_t remain = strlen(p);
+    size_t chunk = remain > (size_t)maxChars ? (size_t)maxChars : remain;
+    if (chunk < remain) {
+      size_t br = chunk;
+      while (br > 8 && p[br - 1] != ' ') br--;
+      if (br <= 8) br = chunk;
+      chunk = br;
+    }
+    if (chunk >= sizeof(lines[0])) chunk = sizeof(lines[0]) - 1;
+    memcpy(lines[nLines], p, chunk);
+    lines[nLines][chunk] = 0;
+    size_t tl = strlen(lines[nLines]);
+    while (tl > 0 && lines[nLines][tl - 1] == ' ') lines[nLines][--tl] = 0;
+    p += chunk;
+    if (lines[nLines][0]) nLines++;
+  }
+  if (nLines <= 0) return;
+
+  const int cardH = 2 * padY + nLines * lh;
+  Rect r = { (int16_t)cardX, (int16_t)cardY, (int16_t)cardW, (int16_t)cardH };
+  fillRoundRectGradientV(r, 12,
+                         blendRGB565(UI_CARD, UI_ACCENT, 0.38f),
+                         blendRGB565(UI_CARD, UI_ACCENT, 0.10f));
+  gfx->drawRoundRect(cardX, cardY, cardW, cardH, 12, UI_ACCENT);
+  gfx->drawRoundRect(cardX + 1, cardY + 1, cardW - 2, cardH - 2, 11,
+                     blendRGB565(UI_ACCENT, RGB565_WHITE, 0.32f));
+  gfx->fillRoundRect(cardX + 8, cardY + padY, stripeW, nLines * lh, 2, UI_ACCENT2);
+
+  gfx->setTextSize(ts);
+  gfx->setTextColor(UI_TEXT);
+  const int textLeft = cardX + 8 + stripeW + stripeGap;
+  const int textRight = cardX + cardW - padX;
+  const int textW = textRight - textLeft;
+  int ty = cardY + padY + 2;
+  for (int i = 0; i < nLines; i++) {
+    int lw = (int)strlen(lines[i]) * cw;
+    int lx = textLeft + (textW - lw) / 2;
+    if (lx < textLeft) lx = textLeft;
+    gfx->setCursor((int16_t)lx, (int16_t)ty);
+    gfx->print(lines[i]);
+    ty += lh;
+  }
+}
+
 static void drawPasswordScreen(const char* title, const char* pw, bool masked) {
   gfx->fillScreen(RGB565_BLACK);
   const bool secLockPwTopBurger = (g_screen == UIScreen::SECURITY_LOCK_PW_CONFIRM_VAULT
                                    || g_screen == UIScreen::SECURITY_LOCK_PW_SETUP
                                    || g_screen == UIScreen::SECURITY_DURESS_PW_SETUP);
   drawTopBar(title, secLockPwTopBurger);
+
+  const bool createPwScreen = (g_screen == UIScreen::CREATE_PASSWORD || g_screen == UIScreen::CREATE_PASSWORD2
+                               || g_screen == UIScreen::BACKUP_PASSWORD1 || g_screen == UIScreen::BACKUP_PASSWORD2);
+  if (createPwScreen && !g_busy)
+    drawPasswordCreateHintCard(g_createVaultPasswordThenAdd ? kMsgVaultPwCreated : kMsgBackupPwCreated);
 
   // Password field geometry (messages stack upward from just below this)
   const int boxX = 24, boxY = 195, boxW = 272, boxH = 48;
@@ -29460,6 +30340,121 @@ static void showCodeDrawWrappedInViewport(const char* text, int16_t x0, int16_t 
   }
 }
 
+static size_t backup_spb1_chunk_take(size_t i, size_t nTotal) {
+  if (i >= nTotal) return 0;
+  size_t rem = nTotal - i;
+  return (rem > 5) ? 4 : rem;
+}
+
+static int backup_spb1_box_count_for_len(size_t nTotal) {
+  int n = 0;
+  for (size_t i = 0; i < nTotal; ) {
+    size_t take = backup_spb1_chunk_take(i, nTotal);
+    if (!take) break;
+    i += take;
+    n++;
+  }
+  return n;
+}
+
+static int backup_spb1_restore_target_len(size_t payloadLen) {
+  return (payloadLen > BACKUP_SPB1_PAYLOAD_12) ? (4 + BACKUP_SPB1_PAYLOAD_24) : (4 + BACKUP_SPB1_PAYLOAD_12);
+}
+
+static int backup_spb1_box_for_index(size_t pos, size_t nTotal) {
+  if (pos >= nTotal) return 0;
+  size_t i = 0;
+  int boxNum = 1;
+  while (i < nTotal) {
+    size_t take = backup_spb1_chunk_take(i, nTotal);
+    if (!take) break;
+    if (pos < i + take) return boxNum;
+    i += take;
+    boxNum++;
+  }
+  return 0;
+}
+
+/** 3-column SPB1 grid. targetLen 0 = compact length only. highlightBox 1-based, 0 = none. */
+static int16_t drawBackupSpb1BoxesEx(const char* compact, int16_t y0, int targetLen,
+                                    int boxH, int gap, int textSize, int highlightBox, bool showNumbers) {
+  if (!compact) compact = "";
+  const size_t filled = strlen(compact);
+  if (targetLen <= 0) targetLen = (int)filled;
+  if (targetLen < 4) targetLen = 4;
+  if (boxH < 18) boxH = 18;
+  if (gap < 2) gap = 2;
+  if (textSize < 1) textSize = 1;
+  const int cols = 3;
+  const int margin = 12;
+  const int boxW = (LCD_W - 2 * margin - (cols - 1) * gap) / cols;
+  const int rad = (boxH >= 30) ? 8 : 5;
+  const int charW = 6 * textSize;
+  const int charH = 8 * textSize;
+  int16_t x = (int16_t)margin;
+  int16_t y = y0;
+  int col = 0;
+  size_t i = 0;
+  int boxNum = 1;
+  while (i < (size_t)targetLen) {
+    size_t take = backup_spb1_chunk_take(i, (size_t)targetLen);
+    if (!take) break;
+    const bool first = (boxNum == 1);
+    const bool hl = (highlightBox == boxNum);
+    size_t have = 0;
+    char chunk[8];
+    if (i < filled) {
+      have = filled - i;
+      if (have > take) have = take;
+      memcpy(chunk, compact + i, have);
+    }
+    chunk[have] = 0;
+    gfx->fillRoundRect(x, y, boxW, boxH, rad, (have || first) ? UI_CARD : UI_BG);
+    uint16_t border = first ? UI_ACCENT : (hl ? UI_ACCENT : UI_BORDER);
+    gfx->drawRoundRect(x, y, boxW, boxH, rad, border);
+    if (hl && !first) {
+      int inset = (boxH >= 26) ? 1 : 0;
+      if (inset)
+        gfx->drawRoundRect(x + inset, y + inset, boxW - 2 * inset, boxH - 2 * inset, rad > 1 ? rad - 1 : 1, UI_ACCENT);
+    }
+    if (showNumbers) {
+      gfx->setTextSize(1);
+      gfx->setTextColor(RGB565_SILVER);
+      gfx->setCursor(x + 3, y + 2);
+      gfx->print(boxNum);
+    }
+    if (have) {
+      gfx->setTextSize(textSize);
+      gfx->setTextColor(first ? UI_ACCENT : UI_TEXT);
+      const int tw = (int)have * charW;
+      int tx = x + (boxW - tw) / 2;
+      int ty = y + (boxH - charH) / 2;
+      if (showNumbers && ty < y + 10) ty = y + 10;
+      if (tx < x + 2) tx = x + 2;
+      gfx->setCursor(tx, ty);
+      gfx->print(chunk);
+    }
+    i += take;
+    boxNum++;
+    col++;
+    if (col >= cols) {
+      col = 0;
+      x = (int16_t)margin;
+      y = (int16_t)(y + boxH + gap);
+    } else {
+      x = (int16_t)(x + boxW + gap);
+    }
+  }
+  if (col != 0) y = (int16_t)(y + boxH);
+  else y = (int16_t)(y - gap);
+  return (int16_t)(y - y0);
+}
+
+static int16_t drawBackupSpb1Boxes(const char* compact, int16_t y0) {
+  if (!backup_spb1_compact_ok(compact)) return 0;
+  return drawBackupSpb1BoxesEx(compact, y0, 0, 36, 6, 2, 0, true);
+}
+
 static void drawShowCode(const char* title, const char* code) {
   gfx->fillScreen(RGB565_BLACK);
   drawTopBar(title, true);
@@ -29478,7 +30473,6 @@ static void drawShowCode(const char* title, const char* code) {
   }
 
   const int16_t vpBottom = 406;
-  // Backup block 25px lower than original; SPF1 caption sits directly above the scroll viewport.
   const int16_t vpTop = (int16_t)((spf1 ? 84 : 78) + 25);
   if (spf1) {
     gfx->setTextColor(RGB565_CYAN);
@@ -29489,22 +30483,40 @@ static void drawShowCode(const char* title, const char* code) {
     gfx->setTextColor(RGB565_WHITE);
   }
 
-  const char* msgSd = (g_msg[0] && (strstr(g_msg, "microSD") || strstr(g_msg, "SD"))) ? g_msg : nullptr;
-  int totalH = 0;
-  if (msgSd) totalH += showCodeMeasureWrappedHeight(msgSd);
-  totalH += showCodeMeasureWrappedHeight(disp && disp[0] ? disp : "");
-  int vpH = (int)vpBottom - (int)vpTop;
-  int maxScroll = totalH - vpH;
-  if (maxScroll < 0) maxScroll = 0;
-  if (g_showCodeScrollPx > maxScroll) g_showCodeScrollPx = (int16_t)maxScroll;
-  if (g_showCodeScrollPx < 0) g_showCodeScrollPx = 0;
-  g_showCodeMaxScrollPx = (int16_t)maxScroll;
+  char spb1Compact[BACKUP_SPB1_COMPACT_MAX];
+  backup_spb1_compact_chars(disp, spb1Compact, sizeof(spb1Compact));
+  const bool spb1Boxes = !spf1 && backup_spb1_compact_ok(spb1Compact);
 
-  int16_t contentY = 0;
-  if (msgSd) {
-    showCodeDrawWrappedInViewport(msgSd, 10, vpTop, vpBottom, g_showCodeScrollPx, &contentY, RGB565_GREEN);
+  const bool sdFail = g_msg[0] && (strstr(g_msg, "not ready") || strstr(g_msg, "failed") || strstr(g_msg, "Failed"));
+  const char* msgSd = (g_msg[0] && (strstr(g_msg, "microSD") || strstr(g_msg, "SD") || strstr(g_msg, "Auto-save"))) ? g_msg : nullptr;
+  const uint16_t msgSdCol = sdFail ? RGB565_ORANGE : RGB565_GREEN;
+  if (spb1Boxes) {
+    int16_t gridY = vpTop;
+    if (msgSd) {
+      int16_t contentY = 0;
+      showCodeDrawWrappedInViewport(msgSd, 10, vpTop, vpBottom, 0, &contentY, msgSdCol);
+      gridY = (int16_t)(vpTop + contentY + 6);
+    }
+    g_showCodeScrollPx = 0;
+    g_showCodeMaxScrollPx = 0;
+    drawBackupSpb1Boxes(spb1Compact, gridY);
+  } else {
+    int totalH = 0;
+    if (msgSd) totalH += showCodeMeasureWrappedHeight(msgSd);
+    totalH += showCodeMeasureWrappedHeight(disp && disp[0] ? disp : "");
+    int vpH = (int)vpBottom - (int)vpTop;
+    int maxScroll = totalH - vpH;
+    if (maxScroll < 0) maxScroll = 0;
+    if (g_showCodeScrollPx > maxScroll) g_showCodeScrollPx = (int16_t)maxScroll;
+    if (g_showCodeScrollPx < 0) g_showCodeScrollPx = 0;
+    g_showCodeMaxScrollPx = (int16_t)maxScroll;
+
+    int16_t contentY = 0;
+    if (msgSd) {
+      showCodeDrawWrappedInViewport(msgSd, 10, vpTop, vpBottom, g_showCodeScrollPx, &contentY, msgSdCol);
+    }
+    showCodeDrawWrappedInViewport(disp && disp[0] ? disp : "", 10, vpTop, vpBottom, g_showCodeScrollPx, &contentY, RGB565_WHITE);
   }
-  showCodeDrawWrappedInViewport(disp && disp[0] ? disp : "", 10, vpTop, vpBottom, g_showCodeScrollPx, &contentY, RGB565_WHITE);
 
   drawBtn(BTN_SHOWQR, "QR", RGB565_BLUE, 2);
 #if SEEDMASK_USB_HID_KEYBOARD
@@ -29598,26 +30610,43 @@ static void drawShowCodeFullscreen() {
     gfx->print("Length grows with data.");
     vpTop = 76;
   }
+  char spb1Fs[BACKUP_SPB1_COMPACT_MAX];
+  backup_spb1_compact_chars(disp, spb1Fs, sizeof(spb1Fs));
+  const bool spb1Boxes = !spf1 && backup_spb1_compact_ok(spb1Fs);
   const int16_t vpBottom = (int16_t)(LCD_H - 22);
-  const char* msgSd = (g_msg[0] && (strstr(g_msg, "microSD") || strstr(g_msg, "SD"))) ? g_msg : nullptr;
-  int totalH = 0;
-  if (msgSd) totalH += showCodeMeasureWrappedHeight(msgSd);
-  totalH += showCodeMeasureWrappedHeight(disp && disp[0] ? disp : "");
-  int vpH = (int)vpBottom - (int)vpTop;
-  int maxScroll = totalH - vpH;
-  if (maxScroll < 0) maxScroll = 0;
-  if (g_showCodeFullscreenScrollPx > maxScroll) g_showCodeFullscreenScrollPx = (int16_t)maxScroll;
-  if (g_showCodeFullscreenScrollPx < 0) g_showCodeFullscreenScrollPx = 0;
-  g_showCodeFullscreenMaxScrollPx = (int16_t)maxScroll;
-  int16_t contentY = 0;
-  if (msgSd) {
-    showCodeDrawWrappedInViewport(msgSd, 10, vpTop, vpBottom, g_showCodeFullscreenScrollPx, &contentY, RGB565_GREEN);
+  const bool sdFail = g_msg[0] && (strstr(g_msg, "not ready") || strstr(g_msg, "failed") || strstr(g_msg, "Failed"));
+  const char* msgSd = (g_msg[0] && (strstr(g_msg, "microSD") || strstr(g_msg, "SD") || strstr(g_msg, "Auto-save"))) ? g_msg : nullptr;
+  const uint16_t msgSdCol = sdFail ? RGB565_ORANGE : RGB565_GREEN;
+  if (spb1Boxes) {
+    g_showCodeFullscreenScrollPx = 0;
+    g_showCodeFullscreenMaxScrollPx = 0;
+    int16_t gy = vpTop;
+    if (msgSd) {
+      int16_t contentY = 0;
+      showCodeDrawWrappedInViewport(msgSd, 10, vpTop, vpBottom, 0, &contentY, msgSdCol);
+      gy = (int16_t)(vpTop + contentY + 6);
+    }
+    drawBackupSpb1Boxes(spb1Fs, gy);
+  } else {
+    int totalH = 0;
+    if (msgSd) totalH += showCodeMeasureWrappedHeight(msgSd);
+    totalH += showCodeMeasureWrappedHeight(disp && disp[0] ? disp : "");
+    int vpH = (int)vpBottom - (int)vpTop;
+    int maxScroll = totalH - vpH;
+    if (maxScroll < 0) maxScroll = 0;
+    if (g_showCodeFullscreenScrollPx > maxScroll) g_showCodeFullscreenScrollPx = (int16_t)maxScroll;
+    if (g_showCodeFullscreenScrollPx < 0) g_showCodeFullscreenScrollPx = 0;
+    g_showCodeFullscreenMaxScrollPx = (int16_t)maxScroll;
+    int16_t contentY = 0;
+    if (msgSd) {
+      showCodeDrawWrappedInViewport(msgSd, 10, vpTop, vpBottom, g_showCodeFullscreenScrollPx, &contentY, msgSdCol);
+    }
+    showCodeDrawWrappedInViewport(disp && disp[0] ? disp : "", 10, vpTop, vpBottom, g_showCodeFullscreenScrollPx, &contentY, RGB565_WHITE);
   }
-  showCodeDrawWrappedInViewport(disp && disp[0] ? disp : "", 10, vpTop, vpBottom, g_showCodeFullscreenScrollPx, &contentY, RGB565_WHITE);
   gfx->setTextColor(RGB565_LIGHTGREY);
   gfx->setTextSize(1);
   gfx->setCursor(10, LCD_H - 18);
-  gfx->print("Drag to scroll — tap anywhere or swipe back");
+  gfx->print(spb1Boxes ? "Tap anywhere or swipe back" : "Drag to scroll — tap anywhere or swipe back");
   ui_flush();
 }
 
@@ -29668,7 +30697,10 @@ static void drawRestoreCode() {
   gfx->setTextColor(RGB565_CYAN);
   gfx->setTextSize(1);
   gfx->setCursor(10, 52);
-  gfx->print(g_restorePayloadIsSpf1 ? "Mode: SPF1 (full vault)" : "Mode: SPB1 (seed only)");
+  if (g_msg[0] && !g_restorePayloadIsSpf1)
+    gfx->print(g_msg);
+  else
+    gfx->print(g_restorePayloadIsSpf1 ? "Mode: SPF1 (full vault)" : "Mode: SPB1 (seed only)");
   drawBtn(BTN_RESTORE_SPF1_MODE, g_restorePayloadIsSpf1 ? "Switch to seed-only" : "Switch to full vault", RGB565_DARKGREY, 1);
 
   // QR + "Scan" beside the mode toggle
@@ -29682,18 +30714,34 @@ static void drawRestoreCode() {
     gfx->print("Scan");
   }
 
-  gfx->setTextColor(RGB565_LIGHTGREY);
-  gfx->setTextSize(1);
-  gfx->setCursor(10, 116);
-  gfx->print("Type body or Scan backup QR.");
-
-  gfx->setTextColor(RGB565_CYAN);
-  gfx->setCursor(10, 132);
-  gfx->print(g_msg);
-
-  gfx->setTextColor(RGB565_WHITE);
-  gfx->setCursor(10, 148);
-  gfx->print(g_restoreLineActive ? g_restoreLineActive : g_restoreFull);
+  if (g_restorePayloadIsSpf1) {
+    gfx->setTextColor(RGB565_LIGHTGREY);
+    gfx->setTextSize(1);
+    gfx->setCursor(10, 116);
+    gfx->print("Type body or Scan backup QR.");
+    gfx->setTextColor(RGB565_CYAN);
+    gfx->setCursor(10, 132);
+    gfx->print(g_msg);
+    gfx->setTextColor(RGB565_WHITE);
+    gfx->setCursor(10, 148);
+    gfx->print(g_restoreLineActive ? g_restoreLineActive : g_restoreFull);
+  } else {
+    const size_t payloadLen = g_restorePayload ? strlen(g_restorePayload) : 0;
+    char spb1Rest[BACKUP_SPB1_COMPACT_MAX];
+    snprintf(spb1Rest, sizeof(spb1Rest), "SPB1%s", g_restorePayload ? g_restorePayload : "");
+    const int targetLen = backup_spb1_restore_target_len(payloadLen);
+    const int nBoxes = backup_spb1_box_count_for_len((size_t)targetLen);
+    const int nRows = (nBoxes + 2) / 3;
+    const int16_t gridTop = (int16_t)(BTN_RESTORE_SPF1_MODE.y + BTN_RESTORE_SPF1_MODE.h + 4);
+    const int gridBot = KB_Y0_DEFAULT - 2;
+    const int gap = (nRows >= 6) ? 2 : 5;
+    int boxH = nRows > 0 ? (gridBot - (int)gridTop - (nRows - 1) * gap) / nRows : 24;
+    if (boxH > 36) boxH = 36;
+    if (boxH < 20) boxH = 20;
+    const int textSize = (boxH >= 30) ? 2 : 1;
+    const int highlight = backup_spb1_box_for_index(strlen(spb1Rest), (size_t)targetLen);
+    drawBackupSpb1BoxesEx(spb1Rest, gridTop, targetLen, boxH, gap, textSize, highlight, true);
+  }
 
   drawKeyboard();
 
@@ -30047,7 +31095,8 @@ static void menu_draw_message_card_overlay(void) {
   gfx->drawRoundRect(cardX, cardY, cardW, cardH, 14, UI_ACCENT);
 
   uint16_t msgCol = UI_SUCCESS;
-  if (strstr(g_msg, "Failed") || strstr(g_msg, "Wrong") || strstr(g_msg, "error") || strstr(g_msg, "Error"))
+  if (strstr(g_msg, "Failed") || strstr(g_msg, "Wrong") || strstr(g_msg, "error") || strstr(g_msg, "Error")
+      || strstr(g_msg, "microSD") || strstr(g_msg, "Insert") || strstr(g_msg, "SD save"))
     msgCol = UI_WARN;
   gfx->setTextColor(msgCol);
   gfx->setTextSize(ts);
@@ -32723,12 +33772,11 @@ static void portable_backup_clear(void) {
   prefs.end();
 }
 
-/** Mark a user-facing portable SPB1 backup (create or restore). Ignores oversized / empty strings. */
+/** Mark a user-facing portable SPB1 backup (create or restore). Ignores SPF1 / oversized vault lines. */
 static void portable_backup_set_from_code(const char* code) {
-  if (!code || !code[0] || strlen(code) >= sizeof(g_viewBackupCode) || strlen(code) > 90) {
-    // Vault-blob encodings and SPF1 are not portable "backup code" UI.
-    return;
-  }
+  if (!code || strncmp(code, "SPB1-", 5) != 0) return;
+  const size_t n = strlen(code);
+  if (n < 8 || n >= sizeof(g_viewBackupCode)) return;
   strncpy(g_viewBackupCode, code, sizeof(g_viewBackupCode) - 1);
   g_viewBackupCode[sizeof(g_viewBackupCode) - 1] = 0;
   g_portableBackupReady = true;
@@ -32748,7 +33796,7 @@ static void portable_backup_load_from_nvs(void) {
   prefs.end();
   g_viewBackupCode[0] = 0;
   g_portableBackupReady = false;
-  if (!on || s.length() == 0 || s.length() > 90 || (size_t)s.length() >= sizeof(g_viewBackupCode))
+  if (!on || s.length() == 0 || !s.startsWith("SPB1-") || (size_t)s.length() >= sizeof(g_viewBackupCode))
     return;
   strncpy(g_viewBackupCode, s.c_str(), sizeof(g_viewBackupCode) - 1);
   g_viewBackupCode[sizeof(g_viewBackupCode) - 1] = 0;
@@ -32766,7 +33814,7 @@ static void seed_settings_start_create_backup_code() {
   clearPassword(g_password1);
   clearPassword(g_password2);
   g_pwMasked = true;
-  setMsg("Enter password.");
+  setMsg("Min 12 chars, A-Z, digit, symbol.");
   show(UIScreen::CREATE_PASSWORD);
 }
 
@@ -34244,14 +35292,19 @@ static void drawViewCode() {
     if (*p) sdSavedFilename = p;
   }
 
-  const int16_t codeTop = 60;
-  const int codeMaxH = 200;
-  const int gapAfterCode = 14;
-  const int gapAfterIcon = 16;
+  const int16_t codeTop = 56;
+  const int gapAfterCode = 10;
+  const int gapAfterIcon = 12;
   const int iconW = 128;
   const int iconH = 72;
   int codeDispH = 0;
-  if (g_viewBackupCode[0]) {
+  char viewCompact[BACKUP_SPB1_COMPACT_MAX];
+  backup_spb1_compact_chars(g_viewBackupCode, viewCompact, sizeof(viewCompact));
+  const bool spb1Boxes = backup_spb1_compact_ok(viewCompact);
+  if (spb1Boxes) {
+    codeDispH = drawBackupSpb1Boxes(viewCompact, codeTop);
+  } else if (g_viewBackupCode[0]) {
+    const int codeMaxH = 200;
     int fullH = showCodeMeasureWrappedHeight(g_viewBackupCode);
     codeDispH = (fullH > codeMaxH) ? codeMaxH : fullH;
     int16_t cy = 0;
@@ -41392,6 +42445,33 @@ static void drawWipeInfoBitmapAt(int16_t cx, int16_t cy, bool large, int16_t ox,
   }
 }
 
+static void drawWipeBusyScreen(uint8_t percent) {
+  if (percent > 100) percent = 100;
+  gfx->fillScreen(RGB565_BLACK);
+  drawTopBar(tr("Wipe", "Brisanje"), false);
+  gfx->setTextColor(UI_TEXT);
+  gfx->setTextSize(2);
+  const char* a = tr("Erasing device.", "Brisanje uredjaja.");
+  const char* b = tr("Do not unplug.", "Ne iskljucujte.");
+  int w1 = (int)strlen(a) * 12;
+  int w2 = (int)strlen(b) * 12;
+  gfx->setCursor((LCD_W - w1) / 2, 148);
+  gfx->print(a);
+  gfx->setCursor((LCD_W - w2) / 2, 172);
+  gfx->print(b);
+  char pct[12];
+  snprintf(pct, sizeof(pct), "%u%%", (unsigned)percent);
+  int wp = (int)strlen(pct) * 12;
+  gfx->setCursor((LCD_W - wp) / 2, 214);
+  gfx->print(pct);
+  const int barW = 240, barH = 16;
+  const int barX = (LCD_W - barW) / 2, barY = 248;
+  gfx->drawRoundRect(barX, barY, barW, barH, 5, UI_BORDER);
+  int fill = (int)((barW - 4) * (int)percent / 100);
+  if (fill > 0) gfx->fillRoundRect(barX + 2, barY + 2, fill, barH - 4, 3, UI_ACCENT);
+  ui_flush();
+}
+
 static void drawWipeConfirm() {
   gfx->fillScreen(RGB565_BLACK);
   drawTopBar(tr("Warning", "Upozorenje"), true);
@@ -41506,7 +42586,7 @@ static void handleWipeConfirmTap(uint16_t x, uint16_t y) {
   if (hit(rYes, x, y)) {
     flashKeyRectTranslucent(rYes);
     delay(85);
-    nvs_wipe();
+    nvs_wipe(true);
     screen_lock_load_prefs();
     lockout_load_prefs();
     g_hasVault = false;
@@ -43956,6 +45036,7 @@ static void draw() {
     case UIScreen::HOME: drawHome(); break;
     case UIScreen::CREATE_PICK: drawCreatePick(); break;
     case UIScreen::CREATE_ENTROPY_METHOD: drawCreateEntropyMethod(); break;
+    case UIScreen::CREATE_ENTROPY_HW_WARN: drawCreateEntropyHwWarn(); break;
     case UIScreen::CREATE_DICE_WORDS: drawDiceChooseWords(); break;
     case UIScreen::CREATE_DICE_ROLL: drawDiceRollScreen(); break;
     case UIScreen::CREATE_GEN: drawGenSeed(); break;
@@ -43963,8 +45044,12 @@ static void draw() {
     case UIScreen::CREATE_CONFIRM: drawConfirmTap(); break;
     case UIScreen::CREATE_LOCK_TYPE: drawCreateLockType(); break;
     case UIScreen::CREATE_BACKUP_OPT: drawBackupOpt(); break;
-    case UIScreen::CREATE_PASSWORD: drawPasswordScreen("Backup password", g_password1, g_pwMasked); break;
-    case UIScreen::CREATE_PASSWORD2: drawPasswordScreen("Confirm backup pw", g_password2, g_pwMasked); break;
+    case UIScreen::CREATE_PASSWORD:
+      drawPasswordScreen(g_createVaultPasswordThenAdd ? "Vault password" : "Backup password", g_password1, g_pwMasked);
+      break;
+    case UIScreen::CREATE_PASSWORD2:
+      drawPasswordScreen(g_createVaultPasswordThenAdd ? "Confirm vault pw" : "Confirm backup pw", g_password2, g_pwMasked);
+      break;
     case UIScreen::CREATE_SHOW_CODE: drawShowCode("Backup code", g_backupCode); break;
 
     case UIScreen::BACKUP_CHOOSE_WORDS: drawBackupChooseWords(); break;
@@ -44117,7 +45202,7 @@ static void draw() {
     case UIScreen::SD_FILE_RENAME: drawSdFileRename(); break;
     case UIScreen::EDITOR:
       if (g_editMode == EditMode::NONE || !g_loggedIn) {
-        if (g_hasVault && !g_stateless) drawLockedScreen();
+        if (session_should_show_lock_screen()) drawLockedScreen();
         else drawHome();
       } else {
         drawEditor(g_editorTitle, g_editorHint);
@@ -44144,6 +45229,7 @@ static bool canSwipeBack() {
       return false;  // no swipe to empty-vault menu — user is in “games only” duress session
     case UIScreen::CREATE_PICK:
     case UIScreen::CREATE_ENTROPY_METHOD:
+    case UIScreen::CREATE_ENTROPY_HW_WARN:
     case UIScreen::CREATE_DICE_WORDS:
     case UIScreen::CREATE_DICE_ROLL:
     case UIScreen::CREATE_GEN:
@@ -44301,7 +45387,7 @@ static void performSwipeBack() {
   if (g_editMode != EditMode::NONE) {
     if (!g_loggedIn) {
       exitEditor();
-      if (g_hasVault && !g_stateless) show(UIScreen::LOCKED);
+      if (session_should_show_lock_screen()) show(UIScreen::LOCKED);
       else show(UIScreen::HOME);
       g_touchIgnoreUntil = millis() + 220;
       return;
@@ -44452,6 +45538,10 @@ static void performSwipeBack() {
       show(UIScreen::CREATE_PICK);
       g_touchIgnoreUntil = millis() + 220;
       break;
+    case UIScreen::CREATE_ENTROPY_HW_WARN:
+      show(UIScreen::CREATE_ENTROPY_METHOD);
+      g_touchIgnoreUntil = millis() + 220;
+      break;
     case UIScreen::CREATE_DICE_WORDS:
       show(UIScreen::CREATE_ENTROPY_METHOD);
       g_touchIgnoreUntil = millis() + 220;
@@ -44462,7 +45552,7 @@ static void performSwipeBack() {
       break;
     case UIScreen::CREATE_GEN:
       if (g_seedFromDice) show(UIScreen::CREATE_DICE_ROLL);
-      else show(UIScreen::CREATE_ENTROPY_METHOD);
+      else show(UIScreen::CREATE_ENTROPY_HW_WARN);
       g_touchIgnoreUntil = millis() + 220;
       break;
     case UIScreen::CREATE_VERIFY_CHOICE:
@@ -44488,7 +45578,15 @@ static void performSwipeBack() {
       g_touchIgnoreUntil = millis() + 220;
       break;
     case UIScreen::CREATE_PASSWORD:
-      if (g_createBackupFromSeedSettings) {
+      if (g_createVaultPasswordThenAdd) {
+        UIScreen ret = g_vaultPwThenAddReturn;
+        g_createVaultPasswordThenAdd = false;
+        g_creatingMasterPassword = false;
+        show(ret);
+      } else if (g_creatingMasterPassword) {
+        g_creatingMasterPassword = false;
+        show(UIScreen::PASSWORDS);
+      } else if (g_createBackupFromSeedSettings) {
         g_createBackupFromSeedSettings = false;
         show(UIScreen::SEED_SETTINGS);
       } else {
@@ -45173,7 +46271,7 @@ static void performSwipeBack() {
     case UIScreen::EDITOR:
       exitEditor();
       if (!g_loggedIn) {
-        if (g_hasVault && !g_stateless) show(UIScreen::LOCKED);
+        if (session_should_show_lock_screen()) show(UIScreen::LOCKED);
         else show(UIScreen::HOME);
       } else {
         show(g_prevScreen);
@@ -45193,7 +46291,7 @@ static void handleOrphanEditorScreenTap(uint16_t x, uint16_t y) {
   (void)x;
   (void)y;
   if (g_editMode != EditMode::NONE) return;
-  if (g_hasVault && !g_stateless) show(UIScreen::LOCKED);
+  if (session_should_show_lock_screen()) show(UIScreen::LOCKED);
   else show(UIScreen::HOME);
 }
 
@@ -45402,6 +46500,7 @@ static void show(UIScreen s) {
       || s == UIScreen::BACKUP_CHOOSE_WORDS || s == UIScreen::BACKUP_FROM_SEED || s == UIScreen::BACKUP_REVIEW_WORDS
       || s == UIScreen::BACKUP_PASSWORD1 || s == UIScreen::BACKUP_PASSWORD2 || s == UIScreen::BACKUP_SHOW_CODE
       || s == UIScreen::CREATE_PICK || s == UIScreen::CREATE_ENTROPY_METHOD
+      || s == UIScreen::CREATE_ENTROPY_HW_WARN
       || s == UIScreen::CREATE_DICE_WORDS || s == UIScreen::CREATE_DICE_ROLL
       || s == UIScreen::CREATE_GEN || s == UIScreen::CREATE_VERIFY_CHOICE
       || s == UIScreen::CREATE_CONFIRM || s == UIScreen::CREATE_LOCK_TYPE
@@ -45684,9 +46783,11 @@ static void session_lock_to_home() {
   if (g_editMode != EditMode::NONE) {
     exitEditor();
   }
+  if (!g_screenLockUsesPin && !g_screenLockSeparatePw && g_masterPw[0])
+    lockout_refresh_vpw_hollow_verifier(g_masterPw);
   g_loggedIn = false;
   session_clear_wallet_state_for_lock_screen();
-  if (g_hasVault && !g_stateless) {
+  if (session_should_show_lock_screen()) {
     show(UIScreen::LOCKED);
   } else {
     show(UIScreen::HOME);
@@ -46265,12 +47366,7 @@ static void handleCreatePickTap(uint16_t x, uint16_t y) {
 
 static void handleCreateEntropyMethodTap(uint16_t x, uint16_t y) {
   if (hit(HIT_ENTROPY_HW, x, y)) {
-    g_seedFromDice = false;
-    dice_rolls_reset();
-    g_wc = 12;
-    generate_mnemonic_words(g_wc, g_seedGen);
-    syncGenSeedToDisplay();
-    show(UIScreen::CREATE_GEN);
+    show(UIScreen::CREATE_ENTROPY_HW_WARN);
     return;
   }
   if (hit(HIT_ENTROPY_DICE, x, y)) {
@@ -46279,6 +47375,16 @@ static void handleCreateEntropyMethodTap(uint16_t x, uint16_t y) {
     show(UIScreen::CREATE_DICE_WORDS);
     return;
   }
+}
+
+static void handleCreateEntropyHwWarnTap(uint16_t x, uint16_t y) {
+  if (!hit(BTN_ENTROPY_HW_CONTINUE, x, y)) return;
+  g_seedFromDice = false;
+  dice_rolls_reset();
+  g_wc = 12;
+  generate_mnemonic_words(g_wc, g_seedGen);
+  syncGenSeedToDisplay();
+  show(UIScreen::CREATE_GEN);
 }
 
 static void handleCreateDiceWordsTap(uint16_t x, uint16_t y) {
@@ -46451,7 +47557,7 @@ static void handleBackupOptTap(uint16_t x, uint16_t y) {
   if (hit(BTN_OPT_YES, x, y)) {
     clearPassword(g_password1);
     g_pwMasked = true;
-    setMsg("Backup password (encrypts code only).");
+    setMsg("Min 12 chars, A-Z, digit, symbol.");
     show(UIScreen::CREATE_PASSWORD);
     return;
   }
@@ -46483,62 +47589,25 @@ static void handleCreatePasswordTap(uint16_t x, uint16_t y) {
     flashKeyRectTranslucent(keyRectRow4[2]);
     Serial.println("OK button hit detected!");
 
-    if (strlen(g_password1) < 4) {
-      Serial.println("Password too short");
-      setMsg("Password too short.");
+    if (!backup_password_ok_for_create(g_password1)) {
+      Serial.println("Backup password rejected");
       draw();
       return;
     }
 
     // Check if this is master password creation
     if (g_creatingMasterPassword) {
-      Serial.println("Creating master password...");
-      strncpy(g_masterPw, g_password1, sizeof(g_masterPw) - 1);
-      g_masterPw[sizeof(g_masterPw) - 1] = 0;
+      g_createVaultPasswordThenAdd = true;
+      g_vaultPwThenAddReturn = UIScreen::PASSWORDS;
       g_creatingMasterPassword = false;
-
-      // Generate backup code with master password
-      g_busy = true;
-      g_spin = 0;
-      setMsg("Generating backup code...");
-      draw();
-      yield();
-      delay(20);
-
-      bool ok = make_backup_code_from_seed(
-        (const char(*)[16])g_seed, g_wc,
-        g_masterPw,
-        g_backupCode, sizeof(g_backupCode),
-        !g_stateless);
-
-      g_busy = false;
-
-      if (!ok) {
-        setMsg("Failed to generate backup code");
-        show(UIScreen::ERROR_SCREEN);
-        return;
-      }
-
-      // Auto-save backup code to SD
-      if (sd_ready()) {
-        backup_code_save_to_sd(g_backupCode, g_masterPw, (const char(*)[16])g_seed, g_wc);
-      }
-
-      clearPassword(g_password1);
-      if (g_createBackupFromSeedSettings) {
-        g_createBackupFromSeedSettings = false;
-        portable_backup_set_from_code(g_backupCode);
-        g_backupShowCodeReturnScreen = UIScreen::SEED_SETTINGS;
-        setMsg("");
-        show(UIScreen::BACKUP_SHOW_CODE);
-        return;
-      }
-      setMsg("Master password created! Now you can add passwords.");
-      show(UIScreen::PASSWORDS);
+    }
+    if (g_createVaultPasswordThenAdd) {
+      clearPassword(g_password2);
+      setMsg("Confirm password.");
+      nav_cancel_pending_gesture();
+      show(UIScreen::CREATE_PASSWORD2);
       return;
     }
-
-    // Create-seed / seed-settings backup: go to confirm password, then generate on match
     clearPassword(g_password2);
     setMsg("Confirm password.");
     nav_cancel_pending_gesture();
@@ -46571,11 +47640,18 @@ static void handleCreatePassword2Tap(uint16_t x, uint16_t y) {
     yield();
     delay(20);
 
+    const bool useSessionSeed = g_createBackupFromSeedSettings || g_createVaultPasswordThenAdd;
+    const char (*seedWords)[16] = useSessionSeed ? (const char(*)[16])g_seed : (const char(*)[16])g_seedGen;
+    const bool lockWrapActive = g_screenLockUsesPin || g_screenLockSeparatePw;
+    const bool canRewrapLock = g_onboardLockCred[0] != 0;
+    // Don't rewrite NVS/master when PIN wrap can't follow — that would brick the next unlock.
+    const bool storeVaultNvs = !g_stateless && (!g_createVaultPasswordThenAdd || !lockWrapActive || canRewrapLock);
+
     bool ok = make_backup_code_from_seed(
-      (const char(*)[16])(g_createBackupFromSeedSettings ? g_seed : g_seedGen), g_wc,
+      seedWords, g_wc,
       g_password1,
       g_backupCode, sizeof(g_backupCode),
-      !g_stateless);
+      storeVaultNvs);
     g_busy = false;
 
     if (!ok) {
@@ -46584,12 +47660,10 @@ static void handleCreatePassword2Tap(uint16_t x, uint16_t y) {
     }
 
     if (sd_ready()) {
-      const char(*seedForSd)[16] = g_createBackupFromSeedSettings
-                                     ? (const char(*)[16])g_seed
-                                     : (const char(*)[16])g_seedGen;
-      if (backup_code_save_to_sd(g_backupCode, g_password1, seedForSd, g_wc)) {
-        strncpy(g_msg, "Backup code saved to microSD", sizeof(g_msg) - 1);
-        g_msg[sizeof(g_msg) - 1] = 0;
+      if (backup_code_save_to_sd(g_backupCode, g_password1, seedWords, g_wc)) {
+        char saved[96];
+        snprintf(saved, sizeof(saved), "Backup code saved to microSD as %s", backup_code_sd_basename());
+        setMsg(saved);
       } else {
         strncpy(g_msg, "Auto-save failed!", sizeof(g_msg) - 1);
         g_msg[sizeof(g_msg) - 1] = 0;
@@ -46599,15 +47673,29 @@ static void handleCreatePassword2Tap(uint16_t x, uint16_t y) {
       g_msg[sizeof(g_msg) - 1] = 0;
     }
 
-    strncpy(g_masterPw, g_password1, sizeof(g_masterPw) - 1);
-    g_masterPw[sizeof(g_masterPw) - 1] = 0;
+    if (storeVaultNvs) {
+      strncpy(g_masterPw, g_password1, sizeof(g_masterPw) - 1);
+      g_masterPw[sizeof(g_masterPw) - 1] = 0;
+    }
     clearPassword(g_password1);
     clearPassword(g_password2);
 
     // Keep lock PIN/password wrapping the new vault/backup encrypt key.
-    if (g_onboardLockCred[0] && !onboard_rewrap_lock_for_master()) {
+    if (storeVaultNvs && g_onboardLockCred[0] && !onboard_rewrap_lock_for_master()) {
       setMsg("Lock wrap failed");
       show(UIScreen::ERROR_SCREEN);
+      return;
+    }
+
+    if (g_createVaultPasswordThenAdd) {
+      g_createVaultPasswordThenAdd = false;
+      portable_backup_set_from_code(g_backupCode);
+      UIScreen ret = g_vaultPwThenAddReturn;
+      if (ret != UIScreen::PASSWORDS && ret != UIScreen::NOTES && ret != UIScreen::TFA_LIST)
+        ret = UIScreen::PASSWORDS;
+      setMsg("");
+      nav_cancel_pending_gesture();
+      show(ret);
       return;
     }
 
@@ -46615,7 +47703,6 @@ static void handleCreatePassword2Tap(uint16_t x, uint16_t y) {
       g_createBackupFromSeedSettings = false;
       portable_backup_set_from_code(g_backupCode);
       g_backupShowCodeReturnScreen = UIScreen::SEED_SETTINGS;
-      setMsg("");
       nav_cancel_pending_gesture();
       show(UIScreen::BACKUP_SHOW_CODE);
       return;
@@ -46737,7 +47824,7 @@ static void handleBackupReviewWordsTap(uint16_t x, uint16_t y) {
     clearPassword(g_password1);
     clearPassword(g_password2);
     g_pwMasked = true;
-    setMsg("Enter password.");
+    setMsg("Min 12 chars, A-Z, digit, symbol.");
     show(UIScreen::BACKUP_PASSWORD1);
     return;
   }
@@ -46751,8 +47838,7 @@ static void handleBackupPassword1Tap(uint16_t x, uint16_t y) {
   }
   if (hitOkKey(x, y)) {
     flashKeyRectTranslucent(keyRectRow4[2]);
-    if (strlen(g_password1) < 4) {
-      setMsg("Password too short.");
+    if (!backup_password_ok_for_create(g_password1)) {
       draw();
       return;
     }
@@ -46798,7 +47884,9 @@ static void handleBackupPassword2Tap(uint16_t x, uint16_t y) {
       Serial.println("SD is ready, attempting auto-save...");
       if (backup_code_save_to_sd(g_backupCode, g_password1, (const char(*)[16])g_seedGen, g_wc)) {
         Serial.println("Auto-save successful (from seed)!");
-        setMsg("Backup code saved to microSD");
+        char saved[96];
+        snprintf(saved, sizeof(saved), "Backup code saved to microSD as %s", backup_code_sd_basename());
+        setMsg(saved);
         draw();  // Refresh screen to show message
       } else {
         Serial.println("Auto-save failed (from seed)!");
@@ -46807,6 +47895,8 @@ static void handleBackupPassword2Tap(uint16_t x, uint16_t y) {
       }
     } else {
       Serial.println("SD is not ready, skipping auto-save (from seed)");
+      strncpy(g_msg, "SD not ready for backup", sizeof(g_msg) - 1);
+      g_msg[sizeof(g_msg) - 1] = 0;
     }
 
     session_login_from_seed((const char(*)[16])g_seed, g_wc, g_backupCode);
@@ -46895,6 +47985,21 @@ static void handleShowCodeTap(uint16_t x, uint16_t y) {
     }
   }
   if (hit(BTN_SHOWQR, x, y)) {
+    const char* disp = (g_pwScreenSpf1BackupCode && g_pwScreenSpf1BackupCode[0]) ? g_pwScreenSpf1BackupCode : g_backupCode;
+    if (disp && (strncmp(disp, "SPB1-", 5) == 0 || strncmp(disp, "spb1-", 5) == 0)) {
+      if (!disp[5] || !g_viewQrCustomPayload) {
+        setMsg("No code yet");
+        draw();
+        return;
+      }
+      snprintf(g_viewQrCustomPayload, VIEW_QR_CUSTOM_PAYLOAD_MAX, "%s", disp);
+      snprintf(g_viewQrCustomTitle, sizeof(g_viewQrCustomTitle), "Backup code");
+      g_viewQrCustomBackScreen = g_screen;
+      g_viewQrCustomDoneScreen = g_screen;
+      g_viewQrCustomActive = true;
+      show(UIScreen::VIEW_QR);
+      return;
+    }
     openVaultQrFromBackupFlow();
     return;
   }
@@ -46975,6 +48080,7 @@ static void handleRestoreCodeTap(uint16_t x, uint16_t y) {
     if (hit(BTN_RESTORE_METHOD_CODE, x, y)) {
       g_restoreCodeEntryMode = true;
       g_restorePayloadIsSpf1 = false;
+      restorePayload_clear();
       setMsg("");
       draw();
       return;
@@ -47016,6 +48122,8 @@ static void handleRestoreCodeTap(uint16_t x, uint16_t y) {
 
   if (hit(BTN_RESTORE_SPF1_MODE, x, y)) {
     g_restorePayloadIsSpf1 = !g_restorePayloadIsSpf1;
+    if (!g_restorePayloadIsSpf1 && g_restorePayload && strlen(g_restorePayload) > BACKUP_SPB1_PAYLOAD_24)
+      g_restorePayload[BACKUP_SPB1_PAYLOAD_24] = 0;
     setMsg("");
     draw();
     return;
@@ -47387,7 +48495,12 @@ static void handleRestorePasswordTap(uint16_t x, uint16_t y) {
     }
 
     // ---------- QR: backup code only (SPB1-) — restore seed only, do NOT load vault from SD ----------
-    if (strstr(g_msg, "QR OK") && strlen(g_password1) >= 4 && strncmp(g_restoreFull, "SPB1-", 5) == 0) {
+    if (strstr(g_msg, "QR OK") && strncmp(g_restoreFull, "SPB1-", 5) == 0) {
+      if (strlen(g_password1) < BACKUP_PASSWORD_MIN_LEN) {
+        setMsg("Use at least 12 characters.");
+        draw();
+        return;
+      }
       uint8_t wc = 12;
       bool ok = restore_seed_from_backup_code(g_restoreFull, g_password1, s_restore_out, wc, true);
       if (!ok) {
@@ -47409,8 +48522,8 @@ static void handleRestorePasswordTap(uint16_t x, uint16_t y) {
     // ---------- SD: decrypt backup code (.bin or legacy path); then choose vault vs seed-only ----------
     if (strstr(g_msg, "Enter password to decrypt backup code")) {
 
-      if (strlen(g_password1) < 4) {
-        setMsg("Password too short.");
+      if (strlen(g_password1) < BACKUP_PASSWORD_MIN_LEN) {
+        setMsg("Use at least 12 characters.");
         draw();
         return;
       }
@@ -47541,9 +48654,15 @@ static void handleRestorePasswordTap(uint16_t x, uint16_t y) {
 
     // ---------- Manual restore path ----------
     restorePayload_buildFull();
+    const char* codeLine = (g_restoreLineActive && g_restoreLineActive[0]) ? g_restoreLineActive : g_restoreFull;
 
     if (strlen(g_password1) < 4) {
       setMsg("Password too short.");
+      draw();
+      return;
+    }
+    if (codeLine && strncmp(codeLine, "SPB1-", 5) == 0 && strlen(g_password1) < BACKUP_PASSWORD_MIN_LEN) {
+      setMsg("Use at least 12 characters.");
       draw();
       return;
     }
@@ -47554,7 +48673,6 @@ static void handleRestorePasswordTap(uint16_t x, uint16_t y) {
     draw();
 
     uint8_t wc = 12;
-    const char* codeLine = (g_restoreLineActive && g_restoreLineActive[0]) ? g_restoreLineActive : g_restoreFull;
     bool ok = restore_seed_from_backup_code(codeLine, g_password1, s_restore_out, wc, true);
 
     g_busy = false;
@@ -47696,7 +48814,6 @@ static void session_finish_duress_unlock(const char* cred, bool credIsPin, Dures
 static bool lockout_silent_armed_unlock_ok_go_home() {
   if (!g_lockoutSilentWipeArmed) return false;
   char mpwUnwrap[128];
-  uint8_t wc = 12;
 
   if (s_lockoutSvSlMode == 1) {
     if (s_lockoutSvPinWrapLen < 28) return false;
@@ -47708,12 +48825,10 @@ static bool lockout_silent_armed_unlock_ok_go_home() {
     g_screenLockSeparatePw = false;
     if (!screen_lock_pin_unwrap(g_password1, mpwUnwrap, sizeof(mpwUnwrap))) {
       secure_memzero(mpwUnwrap, sizeof(mpwUnwrap));
-      screen_lock_clear_pin_mode();
       return false;
     }
     secure_memzero(mpwUnwrap, sizeof(mpwUnwrap));
-    screen_lock_clear_pin_mode();
-    lockout_clear_silent_wipe_snapshot();
+    lockout_disarm_hollow_lock();
     clearPassword(g_password1);
     setMsg("");
     show(UIScreen::HOME);
@@ -47728,23 +48843,20 @@ static bool lockout_silent_armed_unlock_ok_go_home() {
     g_screenLockSeparatePw = true;
     if (!screen_lock_separate_pw_unwrap(g_password1, mpwUnwrap, sizeof(mpwUnwrap))) {
       secure_memzero(mpwUnwrap, sizeof(mpwUnwrap));
-      screen_lock_clear_pin_mode();
       return false;
     }
     secure_memzero(mpwUnwrap, sizeof(mpwUnwrap));
-    screen_lock_clear_pin_mode();
-    lockout_clear_silent_wipe_snapshot();
+    lockout_disarm_hollow_lock();
     clearPassword(g_password1);
     setMsg("");
     show(UIScreen::HOME);
     return true;
   }
 
-  if (s_lockoutSvVaultLen == 0) return false;
-  if (!restore_seed_from_vault_blob(s_lockoutSvVaultBuf, s_lockoutSvVaultLen, g_password1, s_restore_out, wc))
+  if (!lockout_hollow_constant_unwrap(g_password1))
     return false;
 
-  lockout_clear_silent_wipe_snapshot();
+  lockout_disarm_hollow_lock();
   clearPassword(g_password1);
   setMsg("");
   show(UIScreen::HOME);
@@ -47881,6 +48993,7 @@ static void handleLockedScreenSubmit() {
     // Internal vault encoding for SPE1/helpers — not a user portable "backup code".
     vault_blob_to_code_string(vb, vl, g_backupCode, sizeof(g_backupCode));
     if (!g_screenLockUsesPin && !g_screenLockSeparatePw) {
+      lockout_refresh_vpw_hollow_verifier(g_password1);
       strncpy(g_masterPw, g_password1, sizeof(g_masterPw) - 1);
       g_masterPw[sizeof(g_masterPw) - 1] = 0;
     }
@@ -51531,15 +52644,7 @@ static void handlePwNotesTap(uint16_t x, uint16_t y) {
   }
 
   if (hitBottomListAction(BTN_LIST_ADD, x, y) && !nav_bar_home_tap_hit((int16_t)x, (int16_t)y)) {
-    // Check if master password exists for password operations (decoy uses duress credential for NVS).
-    if (g_screen == UIScreen::PASSWORDS && !g_masterPw[0] && !decoy_vault_persist_active()) {
-      // Prompt user to create master password first
-      setMsg("Create master password to encrypt your passwords. This password will be used to decrypt backup codes, QR codes, and SD restores.");
-      clearPassword(g_password1);
-      g_creatingMasterPassword = true;  // Flag to indicate master password creation
-      show(UIScreen::CREATE_PASSWORD);
-      return;
-    }
+    if (pw_notes_tfa_prompt_vault_password_if_needed(g_screen)) return;
 
     // Passwords are only loaded when restoring from a backup (backup code, QR vault, or SD backup/vault).
     // We do NOT auto-load pw_v1.bin here — that would mix "whatever is on SD" with current seed and break deterministic restore.
@@ -53109,6 +54214,8 @@ void setup() {
   screen_lock_load_prefs();
   duress_load_all_prefs();
   lockout_load_prefs();
+  lockout_preload_vpw_hollow_from_nvs();
+  lockout_load_hollow_armed_from_nvs();
   // Loads legacy btc_ac_* only; xfp-keyed list needs master seed (see btc_accounts_load_from_prefs after unlock).
   crypto_accounts_load_all();
   // Read-write so namespace opens reliably; stateless preference (default = stateful / persistent)
@@ -53165,7 +54272,13 @@ void setup() {
     }
     g_hasVault = false;
   }
-  if (g_hasVault) {
+  if (g_lockoutSilentWipeArmed || g_lockoutSilentNoVerify) {
+    g_hasVault = false;
+    g_pwMasked = true;
+    clearPassword(g_password1);
+    show(UIScreen::LOCKED);
+    g_touchIgnoreUntil = millis() + 400;
+  } else if (g_hasVault) {
     // Incomplete restore/create lock setup: never boot into vault-password unlock.
     if (screen_lock_setup_required() && !g_screenLockUsesPin && !g_screenLockSeparatePw) {
       discard_incomplete_onboard_lock_vault();
@@ -56252,6 +57365,7 @@ after_hold_del:
         case UIScreen::HOME: handleHomeTap(sx, sy); break;
         case UIScreen::CREATE_PICK: handleCreatePickTap(sx, sy); break;
         case UIScreen::CREATE_ENTROPY_METHOD: handleCreateEntropyMethodTap(sx, sy); break;
+        case UIScreen::CREATE_ENTROPY_HW_WARN: handleCreateEntropyHwWarnTap(sx, sy); break;
         case UIScreen::CREATE_DICE_WORDS: handleCreateDiceWordsTap(sx, sy); break;
         case UIScreen::CREATE_DICE_ROLL: handleCreateDiceRollTap(sx, sy); break;
         case UIScreen::CREATE_GEN: handleCreateGenTap(sx, sy); break;

@@ -9,11 +9,7 @@ This tree is the **corresponding source** for SeedMask device firmware builds.
 - **License:** [GNU GPLv3](LICENSE) — see also [LICENSE.note](LICENSE.note) and [LICENSES/GPL-3.0.txt](LICENSES/GPL-3.0.txt)
 - **Third-party code:** [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) (Trezor, secp256k1, Blockchain Commons, quirc, GFX, Passport-related GPL, …)
 
-When this repository is published on GitHub, use that URL as the public source link for the product (example):
-
-`https://github.com/SeedMask/SeedMask-Firmware`
-
-Until then, this Desktop folder **is** the source tree to publish.
+Public source: [github.com/SeedMask/SeedMask-Firmware](https://github.com/SeedMask/SeedMask-Firmware).
 
 ## Contents
 
@@ -25,6 +21,14 @@ Until then, this Desktop folder **is** the source tree to publish.
 - `docker/` + `scripts/docker-build.sh` — **official** byte-for-byte build path
 
 Status: early public hardware / firmware preview — not a finished retail product release.
+
+## Backup codes (breaking)
+
+Portable seed backups are **SPB1 v2** (password-wrapped). See [`SeedMask_Firmware/docs/THREAT_MODEL.md`](SeedMask_Firmware/docs/THREAT_MODEL.md).
+
+- **Old (v1) backup codes will not restore** after you flash this firmware. Create a new backup code on the device.
+- **Create** password must be 12+ characters with uppercase, digit, and symbol; obvious weak passwords are rejected. Lock PIN and vault unlock are not on this floor.
+- After creating a **seed** backup, **QR** is that backup code (not the password-vault QR).
 
 ## Development (Arduino IDE)
 

@@ -133,6 +133,16 @@ bool pwSvc_append(const char* title, const char* value) {
   return true;
 }
 
+void pwSvc_removeLast() {
+  if (!allow_secrets() || !s_items || s_count == 0) return;
+  uint8_t i = (uint8_t)(s_count - 1);
+  secure_memzero(s_items[i].title, sizeof(s_items[i].title));
+  secure_memzero(s_items[i].value, sizeof(s_items[i].value));
+  s_valueLen[i] = 0;
+  s_selected[i] = false;
+  s_count = i;
+}
+
 void pwSvc_removeSelectedEntries() {
   if (!allow_secrets() || !s_items) return;
   uint8_t n = 0;

@@ -19,6 +19,8 @@ On **`session_lock_to_home()`** ([`SeedMask Firmware.ino`](../SeedMask Firmware.
 - Clears **notes** and **TOTP** arrays (`g_noteItems`, `g_totpItems`).
 - Resets vault QR payload dirty flag / empty QR buffer.
 
+**Device wipe (`nvs_wipe()`):** Erase NVS and SPIFFS (and FAT / coredump if present) with erase → random fill → erase. Does **not** touch the firmware partition or microSD. Then the same RAM clear as lock (`session_lock_to_home` / silent-wipe stay-locked).
+
 **Auto-lock:** There is **no idle timer** in the current code paths found by review—lock is user-initiated (menu) or flow-driven. If product requirements demand **inactivity timeout**, add a `millis()`-based watchdog that calls `session_lock_to_home()` after N minutes of no touch, and document the default N in user-facing materials.
 
 ## `secure_memzero`

@@ -41,6 +41,9 @@ void pwSvc_setValue(uint8_t index, const char* value);
 /** Append one entry; returns false if list is full. */
 bool pwSvc_append(const char* title, const char* value);
 
+/** Drop the last appended entry (persist rollback). */
+void pwSvc_removeLast();
+
 /** List edit mode: drop entries whose checkbox is selected (keep unselected). */
 void pwSvc_removeSelectedEntries();
 
