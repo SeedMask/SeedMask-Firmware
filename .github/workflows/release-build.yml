@@ -41,6 +41,8 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
+          name: SeedMask Firmware ${{ github.ref_name }} (preview)
+          body_path: .github/release-notes.md
           files: |
             dist/SeedMask_Firmware.bin
             dist/SeedMask_Firmware.bootloader.bin
