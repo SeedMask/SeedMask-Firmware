@@ -582,6 +582,7 @@ static void drawCryptoKaspaFee();
 static void handleCryptoKaspaFeeTap(uint16_t x, uint16_t y);
 static void drawCryptoKaspaSignedQr();
 static void handleCryptoKaspaSignedQrTap(uint16_t x, uint16_t y);
+static void kaspa_run_sign(bool navigateUi);
 static void drawCryptoToolsMenu();
 static void handleCryptoToolsMenuTap(uint16_t x, uint16_t y);
 static void drawCryptoToolsVerifyPick();
@@ -12662,6 +12663,9 @@ static const Rect BTN_CRYPTO_SAVE_TX = { 10, 360, 300, 44 };
 static const Rect BTN_CRYPTO_SIGN_SCAN_QR = { 10, 140, 300, 52 };
 static const Rect BTN_CRYPTO_SIGN_LOAD_SD = { 10, 204, 300, 52 };
 static const Rect BTN_CRYPTO_SIGN_SOURCE_BACK = { 10, 392, 300, 48 };
+/// Load-transaction SD browser: OPEN/LOAD + BACK on one lower row.
+static const Rect BTN_CRYPTO_TX_SD_BACK = { 10, 422, 90, 48 };
+static const Rect BTN_CRYPTO_TX_SD_OK = { 220, 422, 90, 48 };
 // PSBT scan (camera) screen BACK.
 // Not at the very bottom, so it doesn't feel "non-quality" next to the camera HUD.
 static Rect BTN_CRYPTO_SCAN_BACK = { 10, 392, 300, 48 };
@@ -12699,11 +12703,18 @@ static int16_t g_psbtSlideDownX = 0;
 static uint32_t g_psbtSlideDragPaintMs = 0;
 static int16_t g_psbtSlidePaintedOffset = -30000;
 static uint32_t g_psbtSlideDragReleaseStartMs = 0;
-/// Block swipe-back briefly after slide-to-sign (same rightward gesture must not dismiss confirm).
+/// Block swipe-back briefly after slide-to-sign (same rightward gesture must not dismiss confirm / signed QR).
 static uint32_t g_psbtSlideSuppressSwipeBackUntil = 0;
+/// True after a successful slide-commit until the next fresh touch-down (survives screen change to signed QR).
+static bool g_psbtSlideCommitBlocksSwipeBack = false;
+/// Slide-commit: main thread signs; a dedicated spinner task keeps the ring animating (with yields → no TWDT).
+static volatile bool g_cryptoSignInProgress = false;
+static bool g_cryptoSignWasKaspa = false;
+static TaskHandle_t g_cryptoSignSpinnerTask = NULL;
 /// Lift finger must be absent this long before snap/commit (glitches shorter than this are ignored).
 static const uint32_t PSBT_SLIDE_DRAG_RELEASE_DEBOUNCE_MS = 68;
-static const uint32_t PSBT_SLIDE_POST_COMMIT_SWIPE_BLOCK_MS = 520;
+/// Long enough that signing + first signed-QR paint finish before the original rightward lift can swipe-back.
+static const uint32_t PSBT_SLIDE_POST_COMMIT_SWIPE_BLOCK_MS = 2200;
 static float g_psbtSlideFilteredX = -1.f;
 static const float PSBT_SLIDE_X_EMA_ALPHA_BASE = 0.52f;
 static const float PSBT_SLIDE_X_EMA_FAST_DV = 12.f;
@@ -12758,6 +12769,66 @@ static uint8_t* g_cryptoPsbtSignedBin = nullptr;
 static size_t g_cryptoPsbtSignedLen = 0;
 static bool g_cryptoTxSdKaspa = false;
 static char g_cryptoTxSdLastSavePath[192] = { 0 };
+/** Signed-tx Save feedback — small card over the QR for ~3s. */
+static char g_cryptoTxSaveFeedbackName[80] = { 0 };
+static uint32_t g_cryptoTxSaveFeedbackUntilMs = 0;
+
+static bool crypto_tx_save_feedback_active(void) {
+  if (!g_cryptoTxSaveFeedbackName[0] || g_cryptoTxSaveFeedbackUntilMs == 0) return false;
+  if ((int32_t)(millis() - g_cryptoTxSaveFeedbackUntilMs) >= 0) {
+    g_cryptoTxSaveFeedbackUntilMs = 0;
+    g_cryptoTxSaveFeedbackName[0] = 0;
+    return false;
+  }
+  return true;
+}
+
+static void crypto_tx_save_feedback_clear(void) {
+  g_cryptoTxSaveFeedbackUntilMs = 0;
+  g_cryptoTxSaveFeedbackName[0] = 0;
+}
+
+static void crypto_tx_save_feedback_set(const char* basename) {
+  if (!basename || !basename[0]) basename = "(file)";
+  strncpy(g_cryptoTxSaveFeedbackName, basename, sizeof(g_cryptoTxSaveFeedbackName) - 1);
+  g_cryptoTxSaveFeedbackName[sizeof(g_cryptoTxSaveFeedbackName) - 1] = 0;
+  g_cryptoTxSaveFeedbackUntilMs = millis() + 3000u;
+  Serial.print("Signed tx Saved as: ");
+  Serial.println(g_cryptoTxSaveFeedbackName);
+}
+
+/** Compact card drawn on top of the signed QR (not a full-screen takeover). */
+static void drawCryptoTxSaveFeedbackCard(void) {
+  if (!crypto_tx_save_feedback_active()) return;
+  const int ts = 1;
+  const int cw = 6 * ts;
+  const int lh = 9 * ts + 2;
+  const int pad = 12;
+  const char* line1 = "Saved as:";
+  const char* line2 = g_cryptoTxSaveFeedbackName;
+  int w1 = (int)strlen(line1) * cw;
+  int w2 = (int)strlen(line2) * cw;
+  int innerW = (w1 > w2) ? w1 : w2;
+  if (innerW < 120) innerW = 120;
+  int cardW = innerW + 2 * pad;
+  if (cardW > LCD_W - 24) cardW = LCD_W - 24;
+  int cardH = 2 * pad + 2 * lh;
+  int cardX = (LCD_W - cardW) / 2;
+  // Sit over the middle of the QR area (below top bar / hint).
+  int cardY = 150;
+  gfx->fillRoundRect(cardX, cardY, cardW, cardH, 12, UI_CARD);
+  gfx->drawRoundRect(cardX, cardY, cardW, cardH, 12, UI_ACCENT);
+  gfx->setTextSize(ts);
+  gfx->setTextColor(UI_SUCCESS);
+  int lx1 = cardX + (cardW - w1) / 2;
+  if (lx1 < cardX + 4) lx1 = cardX + 4;
+  gfx->setCursor((int16_t)lx1, cardY + pad);
+  gfx->print(line1);
+  int lx2 = cardX + (cardW - w2) / 2;
+  if (lx2 < cardX + 4) lx2 = cardX + 4;
+  gfx->setCursor((int16_t)lx2, cardY + pad + lh);
+  gfx->print(line2);
+}
 // true = fountain multipart (animated); false = single static UR frame
 static bool g_cryptoBcUrFountain = false;
 // Animated fountain QR (rotating frames, Passport-style)
@@ -12804,6 +12875,102 @@ static char g_cryptoReviewChgAddr[96];
 static char g_cryptoReviewFee[28];
 /** PSBT Review / Fee: false = BTC (default), true = satoshi display with grouping. */
 static bool g_psbtReviewUnitSats = false;
+/** Review tx (Kaspa + BTC): finger-drag scroll. scrollY <= 0 moves content up. */
+static int16_t g_cryptoTxReviewScrollY = 0;
+static int16_t g_cryptoTxReviewMinScroll = 0;
+static int16_t g_cryptoTxReviewDragLastY = -1;
+static int16_t g_cryptoTxReviewDownX = 0;
+static int16_t g_cryptoTxReviewDownY = 0;
+static bool g_cryptoTxReviewTouchPending = false;
+static bool g_cryptoTxReviewScrolling = false;
+static bool g_cryptoTxReviewDidDrag = false;
+static bool g_cryptoTxReviewNeedsDraw = false;
+static uint32_t g_cryptoTxReviewLastDrawMs = 0;
+/** Mid-drag: cheaper paint helpers (same path every frame — no shift/heal mix). */
+static bool g_cryptoTxReviewScrollLite = false;
+
+static void crypto_tx_review_clamp_scroll(void) {
+  if (g_cryptoTxReviewMinScroll > 0) g_cryptoTxReviewMinScroll = 0;
+  if (g_cryptoTxReviewScrollY < g_cryptoTxReviewMinScroll) g_cryptoTxReviewScrollY = g_cryptoTxReviewMinScroll;
+  if (g_cryptoTxReviewScrollY > 0) g_cryptoTxReviewScrollY = 0;
+}
+
+/** contentBottomY includes current scrollY. Scroll only when content overflows the viewport. */
+static void crypto_tx_review_finish_scroll_metrics(int contentBottomY, int16_t continueY) {
+  const int unscrolledBottom = contentBottomY - (int)g_cryptoTxReviewScrollY;
+  const int viewportBottom = (int)continueY - 8;
+  if (unscrolledBottom <= viewportBottom) {
+    g_cryptoTxReviewMinScroll = 0;
+    g_cryptoTxReviewScrollY = 0;
+    return;
+  }
+  const int extraUnderContinue = 168;
+  int minScroll = viewportBottom - unscrolledBottom - extraUnderContinue;
+  if (minScroll > 0) minScroll = 0;
+  g_cryptoTxReviewMinScroll = (int16_t)minScroll;
+  crypto_tx_review_clamp_scroll();
+}
+
+static bool crypto_tx_review_can_scroll(void) {
+  return g_cryptoTxReviewMinScroll < 0;
+}
+
+static void crypto_tx_review_reset_scroll_touch(void) {
+  g_cryptoTxReviewScrollY = 0;
+  g_cryptoTxReviewMinScroll = 0;
+  g_cryptoTxReviewDragLastY = -1;
+  g_cryptoTxReviewTouchPending = false;
+  g_cryptoTxReviewScrolling = false;
+  g_cryptoTxReviewDidDrag = false;
+  g_cryptoTxReviewNeedsDraw = false;
+  g_cryptoTxReviewLastDrawMs = 0;
+  g_cryptoTxReviewScrollLite = false;
+}
+
+/**
+ * Full framebuffer push without strip tearing. Temporarily leave the TWDT so a
+ * long QSPI transfer cannot reboot mid-scroll (strip flushes caused visible glitches).
+ */
+static void crypto_tx_review_flush_safe(void) {
+  if (!gfx) return;
+  esp_task_wdt_reset();
+  yield();
+#if defined(ARDUINO_ARCH_ESP32)
+  TaskHandle_t self = xTaskGetCurrentTaskHandle();
+  const esp_err_t unreg = esp_task_wdt_delete(self);
+  gfx->flush();
+  if (unreg == ESP_OK) {
+    (void)esp_task_wdt_add(self);
+  }
+#else
+  gfx->flush();
+#endif
+  esp_task_wdt_reset();
+  yield();
+}
+
+/** Mid-drag: consistent lite paint + safe full flush. Finger-up: quality paint. */
+static void crypto_tx_review_scroll_present(bool finalFrame) {
+  esp_task_wdt_reset();
+  yield();
+  g_cryptoTxReviewScrollLite = !finalFrame;
+  g_drawBatchComposite = true;
+  if (g_screen == UIScreen::CRYPTO_REVIEW_KASPA_TX) drawCryptoReviewKaspaTx();
+  else if (g_screen == UIScreen::CRYPTO_REVIEW_PSBT) drawCryptoReviewPsbt();
+  if (finalFrame) nav_bar_draw_overlays();
+  g_drawBatchComposite = false;
+  g_cryptoTxReviewScrollLite = false;
+  esp_task_wdt_reset();
+  yield();
+  crypto_tx_review_flush_safe();
+  g_cryptoTxReviewLastDrawMs = millis();
+  g_cryptoTxReviewNeedsDraw = false;
+}
+
+static bool crypto_tx_review_section_visible(int16_t y, int16_t h, int16_t continueY) {
+  // Generous margin so cards do not pop in/out while scrolling.
+  return (y + h) > 20 && y < (int16_t)(continueY + 120);
+}
 
 static void crypto_invalidate_psbt_review(void);
 
@@ -23511,11 +23678,21 @@ static void crypto_set_signed_ur_type_from_scan(const char* scannedUr) {
 
 // Encode signed PSBT using Blockchain Commons bc-ur (Passport-style: echo g_cryptoSignedUrRegistryType).
 // Retries with smaller fountain fragments until the UR fits our QR encoder (v16 max ~560 chars at ECC-L export).
+static size_t bc_ur_initial_frag_for_payload(size_t payloadLen) {
+  // Start closer to a fitting fragment so we rarely re-run begin()/next_part().
+  if (payloadLen <= 350) return 200u;
+  if (payloadLen <= 800) return 140u;
+  if (payloadLen <= 1600) return 100u;
+  if (payloadLen <= 3200) return 70u;
+  return 50u;
+}
+
 static bool crypto_build_signed_psbt_ur(const uint8_t* psbt, size_t len) {
   if (!psbt || len == 0) return false;
   const size_t kBuf = CRYPTO_PSBT_SIGNED_UR_BYTES;
   const size_t kMaxUri = (size_t)SP_BC_UR_QR_MAX_URI_CHARS;
-  size_t frag = (size_t)SP_BC_UR_MAX_FRAGMENT_LEN;
+  size_t frag = bc_ur_initial_frag_for_payload(len);
+  if (frag > (size_t)SP_BC_UR_MAX_FRAGMENT_LEN) frag = (size_t)SP_BC_UR_MAX_FRAGMENT_LEN;
   if (frag < 40) frag = 40;
   while (frag >= 40) {
     seedmask_bc_ur_reset();
@@ -23626,7 +23803,7 @@ static void crypto_build_signed_psbt_from_scanned() {
     secure_memzero(psbtSignedWork, kBufCap);
     free(psbtWork);
     free(psbtSignedWork);
-    setMsg("Signed PSBT ready");
+    setMsg("");
     return;
   }
   base64_encode(psbtSignedWork, signedLen, g_cryptoPsbtSignedUr);
@@ -23637,7 +23814,7 @@ static void crypto_build_signed_psbt_from_scanned() {
   g_cryptoBcUrFountain = false;
   g_cryptoSignedQrAnimPaused = false;
   g_cryptoSignedQrLastAnimMs = millis();
-  setMsg("UR encode failed — base64 fallback (Sparrow may not scan)");
+  setMsg("");
 }
 
 // Compact SeedQR (Passport / SeedSigner): raw entropy bytes only (checksum bits omitted from tail).
@@ -40293,6 +40470,120 @@ static bool kaspa_has_imported_multisig_policy_for_current_account(void) {
   return false;
 }
 
+/** Name of first imported Kaspa multisig policy matching this account/device (empty if none). */
+static bool kaspa_imported_multisig_policy_name(char* out, size_t outCap) {
+  if (!out || outCap == 0) return false;
+  out[0] = 0;
+  uint32_t cur = MULTISIG_CTX_TAG_UNKNOWN;
+  if (!current_master_xfp_u32(&cur) || !g_multisigWalletNames) return false;
+  for (uint8_t i = 0; i < g_multisigWalletCount; i++) {
+    if (g_multisigWalletContextTag[i] != cur) continue;
+    if (!multisig_payload_is_kaspa_policy(g_multisigWalletPayloads[i])) continue;
+    uint32_t acct = g_multisigWalletBtcAccount[i];
+    if (acct != MULTISIG_ACCOUNT_LEGACY_ANY && acct != g_addrAccount) continue;
+    if (!multisig_payload_matches_current_device(g_multisigWalletPayloads[i])) continue;
+    if (!g_multisigWalletNames[i][0]) continue;
+    strncpy(out, g_multisigWalletNames[i], outCap - 1);
+    out[outCap - 1] = 0;
+    return true;
+  }
+  return false;
+}
+
+/** Name of first imported Bitcoin multisig policy matching this account/device. */
+static bool btc_imported_multisig_policy_name(char* out, size_t outCap) {
+  if (!out || outCap == 0) return false;
+  out[0] = 0;
+  uint32_t cur = MULTISIG_CTX_TAG_UNKNOWN;
+  if (!current_master_xfp_u32(&cur) || !g_multisigWalletNames) return false;
+  for (uint8_t i = 0; i < g_multisigWalletCount; i++) {
+    if (g_multisigWalletContextTag[i] != cur) continue;
+    if (multisig_payload_is_kaspa_policy(g_multisigWalletPayloads[i])) continue;
+    uint32_t acct = g_multisigWalletBtcAccount[i];
+    if (acct != MULTISIG_ACCOUNT_LEGACY_ANY && acct != g_addrAccount) continue;
+    if (!multisig_payload_matches_current_device(g_multisigWalletPayloads[i])) continue;
+    if (!g_multisigWalletNames[i][0]) continue;
+    strncpy(out, g_multisigWalletNames[i], outCap - 1);
+    out[outCap - 1] = 0;
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Compact multisig banner for Review transaction (Kaspa + Bitcoin).
+ * Returns Y just below the badge (includes gap).
+ * cosignerStatus: 1 = yes, 2 = no, 0 = unknown.
+ */
+static int16_t review_draw_multisig_badge(int16_t x, int16_t y, int16_t w, uint16_t accent,
+                                          uint8_t m, uint8_t n, int8_t cosignerStatus,
+                                          const char* policyName) {
+  const bool hasPol = (policyName && policyName[0]);
+  const int16_t h = hasPol ? 58 : 44;
+  const uint16_t bg = blendRGB565(RGB565_BLACK, accent, 0.14f);
+  const uint16_t border = blendRGB565(accent, RGB565_BLACK, 0.40f);
+  if (g_cryptoTxReviewScrollLite) {
+    gfx->fillRect(x, y, w, h, bg);
+    gfx->drawRect(x, y, w, h, border);
+  } else {
+    gfx->fillRoundRect(x, y, w, h, 10, bg);
+    gfx->drawRoundRect(x, y, w, h, 10, border);
+  }
+
+  char title[20];
+  if (m > 0 && n > 0)
+    snprintf(title, sizeof(title), "%u-of-%u", (unsigned)m, (unsigned)n);
+  else
+    snprintf(title, sizeof(title), "MSIG");
+
+  // Top line: "2-of-3 MULTISIG" centered as a group
+  const int gap = 8;
+  const int titleW = (int)strlen(title) * 12;       // size 2
+  const int msW = (int)strlen("MULTISIG") * 6;      // size 1
+  const int topW = titleW + gap + msW;
+  const int16_t topX = (int16_t)(x + (w - topW) / 2);
+  gfx->setTextSize(2);
+  gfx->setTextColor(RGB565_WHITE);
+  gfx->setCursor(topX, (int16_t)(y + 7));
+  gfx->print(title);
+  gfx->setTextSize(1);
+  gfx->setTextColor(blendRGB565(accent, RGB565_WHITE, 0.25f));
+  gfx->setCursor((int16_t)(topX + titleW + gap), (int16_t)(y + 11));
+  gfx->print("MULTISIG");
+
+  const char* cosLine = "Cosigner unchecked";
+  uint16_t cosCol = RGB565_LIGHTGREY;
+  if (cosignerStatus == 1) {
+    cosLine = "You are a cosigner";
+    cosCol = RGB565_GREEN;
+  } else if (cosignerStatus == 2) {
+    cosLine = "Not a cosigner";
+    cosCol = RGB565_RED;
+  }
+  const int cosW = (int)strlen(cosLine) * 6;
+  gfx->setTextSize(1);
+  gfx->setTextColor(cosCol);
+  gfx->setCursor((int16_t)(x + (w - cosW) / 2), (int16_t)(y + 28));
+  gfx->print(cosLine);
+
+  if (hasPol) {
+    char pl[40];
+    snprintf(pl, sizeof(pl), "Policy: %s", policyName);
+    if (strlen(pl) > 36) {
+      pl[33] = '.';
+      pl[34] = '.';
+      pl[35] = '.';
+      pl[36] = 0;
+    }
+    const int polW = (int)strlen(pl) * 6;
+    gfx->setTextColor(blendRGB565(RGB565_WHITE, RGB565_BLACK, 0.35f));
+    gfx->setCursor((int16_t)(x + (w - polW) / 2), (int16_t)(y + 42));
+    gfx->print(pl);
+  }
+  return (int16_t)(y + h + 10);
+}
+
+
 /** Resolve legacy wallets missing msig_*_ctx (runs once after login; list rebuild is then O(n) uint32 compares). */
 static void multisig_resolve_unknown_wallet_tags(void) {
   if (g_multisigWalletCount == 0) return;
@@ -40907,13 +41198,53 @@ static bool kaspa_extract_unsigned_payload(char* buf, size_t* inoutLen, size_t c
     memmove(buf, p, rem + 1);
     *inoutLen = rem;
   }
-  if (seedmask_kaspa_unsigned_is_v2(buf, *inoutLen)) {
-    return kaspa_pskt_qr_payload_looks_valid(buf, *inoutLen);
+  /*
+   * Coordinator "Save transaction" writes seedmask_pskt_draft_v1 envelopes:
+   *   { "format": "...", "unsigned": { "version": 2, ... }, "pskt": { "redeemScript": null, ... } }
+   * A naive version scan finds nested "version":2 and skips unwrap — then "redeemScript":null
+   * falsely trips the multisig-policy gate. Always unwrap "unsigned" when present.
+   */
+  if (strstr(buf, "\"unsigned\"")) {
+    if (!kaspa_json_extract_object_after_key_inplace(buf, inoutLen, cap, "unsigned")) {
+      return false;
+    }
   }
-  if (!kaspa_json_extract_object_after_key_inplace(buf, inoutLen, cap, "unsigned")) {
+  if (!seedmask_kaspa_unsigned_is_v2(buf, *inoutLen)) {
     return false;
   }
-  return kaspa_pskt_qr_payload_looks_valid(buf, *inoutLen) && seedmask_kaspa_unsigned_is_v2(buf, *inoutLen);
+  return kaspa_pskt_qr_payload_looks_valid(buf, *inoutLen);
+}
+
+static void kaspa_clear_loaded_unsigned(void) {
+  g_kaspaPsktScanLen = 0;
+  if (g_kaspaPsktScanBuf) g_kaspaPsktScanBuf[0] = 0;
+  g_kaspaHasSigned = false;
+  g_kaspaSignedJson[0] = 0;
+  g_kaspaExpectedAddr[0] = 0;
+  g_kaspaKpubStatus = -1;
+  crypto_invalidate_kaspa_review();
+}
+
+/** Reject txs that must not enter Review/Sign for this wallet/policy. Sets g_msg on failure. */
+static bool kaspa_accept_loaded_unsigned_for_wallet(void) {
+  if (!g_kaspaPsktScanLen || !g_kaspaPsktScanBuf || !g_kaspaPsktScanBuf[0]) {
+    setMsg("No Kaspa tx loaded");
+    return false;
+  }
+  kaspa_review_refresh_kpub_status();
+  const bool isMs = seedmask_kaspa_unsigned_has_multisig_redeem(g_kaspaPsktScanBuf, g_kaspaPsktScanLen);
+  if (isMs && g_kaspaMultisigPolicyMode != KaspaMultisigPolicyMode::SKIP_VERIFICATION
+      && !kaspa_has_imported_multisig_policy_for_current_account()) {
+    setMsg(g_kaspaMultisigPolicyMode == KaspaMultisigPolicyMode::REQUIRE_EXISTING
+               ? "Policy required - import first"
+               : "Import multisig policy first");
+    return false;
+  }
+  if (g_kaspaKpubStatus == 2) {
+    setMsg(isMs ? "Wrong wallet - not a cosigner" : "Wrong wallet (kpub mismatch)");
+    return false;
+  }
+  return true;
 }
 
 static bool crypto_load_kaspa_unsigned_from_sd_path(const char* path) {
@@ -40927,15 +41258,29 @@ static bool crypto_load_kaspa_unsigned_from_sd_path(const char* path) {
   g_kaspaPsktScanBuf[n] = 0;
   g_kaspaPsktScanLen = n;
   if (!kaspa_extract_unsigned_payload(g_kaspaPsktScanBuf, &g_kaspaPsktScanLen, KASPA_PSKT_SCAN_MAX)) {
-    g_kaspaPsktScanLen = 0;
-    g_kaspaPsktScanBuf[0] = 0;
+    kaspa_clear_loaded_unsigned();
     setMsg("Not a valid Kaspa unsigned JSON");
     return false;
   }
   g_kaspaHasSigned = false;
   g_kaspaSignedJson[0] = 0;
   g_kaspaExpectedAddr[0] = 0;
-  kaspa_review_refresh_kpub_status();
+  if (!kaspa_accept_loaded_unsigned_for_wallet()) {
+    const bool askImport = seedmask_kaspa_unsigned_has_multisig_redeem(g_kaspaPsktScanBuf, g_kaspaPsktScanLen)
+                           && g_kaspaMultisigPolicyMode == KaspaMultisigPolicyMode::ASK_TO_IMPORT
+                           && !kaspa_has_imported_multisig_policy_for_current_account();
+    char errKeep[96];
+    strncpy(errKeep, g_msg, sizeof(errKeep) - 1);
+    errKeep[sizeof(errKeep) - 1] = 0;
+    kaspa_clear_loaded_unsigned();
+    if (askImport) {
+      show(UIScreen::CRYPTO_MULTISIG_IMPORT);
+      setMsg(errKeep[0] ? errKeep : "Import multisig policy first");
+    } else {
+      setMsg(errKeep);
+    }
+    return false;
+  }
   setMsg("Kaspa tx loaded from microSD");
   show(UIScreen::CRYPTO_REVIEW_KASPA_TX);
   return true;
@@ -41062,7 +41407,8 @@ static bool crypto_save_signed_kaspa_to_sd() {
   }
   strncpy(g_cryptoTxSdLastSavePath, path, sizeof(g_cryptoTxSdLastSavePath) - 1);
   g_cryptoTxSdLastSavePath[sizeof(g_cryptoTxSdLastSavePath) - 1] = 0;
-  setMsg("Saved — load in Coordinator");
+  crypto_tx_save_feedback_set(sd_pick_basename_cstr(path));
+  setMsg("");  // feedback uses dedicated full-screen, not g_msg toast
   return true;
 }
 
@@ -41106,7 +41452,8 @@ static bool crypto_save_signed_psbt_to_sd() {
   }
   strncpy(g_cryptoTxSdLastSavePath, path, sizeof(g_cryptoTxSdLastSavePath) - 1);
   g_cryptoTxSdLastSavePath[sizeof(g_cryptoTxSdLastSavePath) - 1] = 0;
-  setMsg("Saved — import in wallet / Coordinator");
+  crypto_tx_save_feedback_set(sd_pick_basename_cstr(path));
+  setMsg("");
   return true;
 }
 
@@ -41195,13 +41542,13 @@ static void drawCryptoTxSdBrowse() {
   if (g_msSdCount > 0 && g_msSdSelectedFile >= 0 && g_msSdSelectedFile < g_msSdCount
       && ms_sd_row_is_openable_entry(g_msSdSelectedFile)) {
     const char* okLbl = g_msSdIsDir[g_msSdSelectedFile] ? "OPEN" : "LOAD";
-    drawGradientSilverButton(BTN_LIST_OK, okLbl, 2);
+    drawGradientSilverButton(BTN_CRYPTO_TX_SD_OK, okLbl, 2);
   }
-  drawGradientSilverButton(BTN_LIST_BACK, "BACK", 2);
+  drawGradientSilverButton(BTN_CRYPTO_TX_SD_BACK, "BACK", 2);
   if (g_msg[0]) {
     gfx->setTextColor(RGB565_CYAN);
     gfx->setTextSize(1);
-    gfx->setCursor(10, 392);
+    gfx->setCursor(10, 400);
     gfx->print(g_msg);
   }
   ui_flush();
@@ -41212,7 +41559,7 @@ static void handleCryptoTxSdBrowseTap(uint16_t x, uint16_t y) {
     show(UIScreen::CRYPTO_SIGN_SOURCE);
     return;
   }
-  if (hit(BTN_LIST_BACK, x, y)) {
+  if (hit(BTN_CRYPTO_TX_SD_BACK, x, y)) {
     show(UIScreen::CRYPTO_SIGN_SOURCE);
     return;
   }
@@ -41228,7 +41575,7 @@ static void handleCryptoTxSdBrowseTap(uint16_t x, uint16_t y) {
       return;
     }
   }
-  if (ms_sd_row_is_openable_entry(g_msSdSelectedFile) && hit(BTN_LIST_OK, x, y)) {
+  if (ms_sd_row_is_openable_entry(g_msSdSelectedFile) && hit(BTN_CRYPTO_TX_SD_OK, x, y)) {
     int sel = g_msSdSelectedFile;
     if (sel < 0 || sel >= g_msSdCount) return;
     if (g_msSdIsDir[sel]) {
@@ -43059,10 +43406,11 @@ static void drawCryptoReviewKaspaTx() {
   if (g_kaspaKpubStatus < 0) kaspa_review_refresh_kpub_status();
   if (!g_kaspaReviewSummaryValid) crypto_refresh_kaspa_review();
   gfx->fillScreen(RGB565_BLACK);
-  drawTopBar("Review transaction", true);
   gfx->setTextColor(RGB565_WHITE);
   const bool hasTx = (g_kaspaPsktScanLen > 0 && g_kaspaPsktScanBuf[0]);
+  const int16_t contY = BTN_KASPA_REVIEW_CONTINUE.y;
   if (!hasTx) {
+    drawTopBar("Review transaction", true);
     gfx->setTextSize(2);
     gfx->setCursor(14, 100);
     gfx->setTextColor(blendRGB565(RGB565_WHITE, RGB565_BLACK, 0.30f));
@@ -43084,104 +43432,140 @@ static void drawCryptoReviewKaspaTx() {
     const int16_t cardPadTop = 10;
     const int16_t cardPadBot = 14;
     const int16_t addrLineH = 22;
+    const int16_t destGlyphH = 16;
     const int16_t chunkGap = 8;
-    const int16_t maxBottom = (int16_t)(BTN_KASPA_REVIEW_CONTINUE.y - 10);
     const int16_t x0 = (int16_t)(cardX + padX);
     const bool hasChange = g_kaspaReviewSummaryValid && g_kaspaReviewSummary.ok
                            && g_kaspaReviewSummary.change_sompi > 0;
     const bool hasChgAddr = hasChange && g_kaspaReviewSummary.change_addr[0] != 0;
+    const bool isMs = g_kaspaReviewSummaryValid && g_kaspaReviewSummary.ok && g_kaspaReviewSummary.is_multisig;
     const int16_t logoW = (int16_t)KASPA_LOGO_RGB565_W;
     const int16_t logoH = (int16_t)KASPA_LOGO_RGB565_H;
-    int16_t y = 54;
+    crypto_tx_review_clamp_scroll();
+    int16_t y = (int16_t)(54 + g_cryptoTxReviewScrollY);
 
-    psbt_review_draw_section_label("Amount", y, labelCol);
-    y = (int16_t)(y + labelH + labelToCard);
-    const int16_t amtCardH = 52;
-    psbt_review_draw_section_card(cardX, y, cardW, amtCardH, cardBg, cardBorder);
-    {
-      const char* unitLab = g_kaspaReviewUnitSompi ? "sompi" : "KAS";
-      const int16_t chipW = (int16_t)(strlen(unitLab) * 6 + 22);
-      const int16_t chipH = 22;
-      const int16_t chipX = (int16_t)(cardX + cardW - padX - chipW);
-      const int16_t chipY = (int16_t)(y + (amtCardH - chipH) / 2);
-      const int16_t logoX = x0;
-      const int16_t logoY = (int16_t)(y + (amtCardH - logoH) / 2);
-      drawCryptoAssetLogo(logoX, logoY, KASPA_LOGO_RGB565, logoW, logoH, false);
-      BTN_KASPA_UNIT = { chipX, (int16_t)(y + 4), chipW, (int16_t)(amtCardH - 8) };
-      gfx->fillRoundRect(chipX, chipY, chipW, chipH, 5,
-                         blendRGB565(RGB565_KASPA_TEAL, RGB565_BLACK, 0.68f));
-      gfx->drawRoundRect(chipX, chipY, chipW, chipH, 5, RGB565_KASPA_TEAL);
-      gfx->setTextSize(1);
-      gfx->setTextColor(RGB565_KASPA_TEAL);
-      gfx->setCursor((int16_t)(chipX + 11), (int16_t)(chipY + 7));
-      gfx->print(unitLab);
-
-      char amtDisp[48];
-      if (g_kaspaReviewSummaryValid && g_kaspaReviewSummary.ok)
-        kaspa_review_format_amount_line(g_kaspaReviewSummary.send_sompi, amtDisp, sizeof(amtDisp));
-      else
-        snprintf(amtDisp, sizeof(amtDisp), "%s", g_kaspaReviewAmt[0] ? g_kaspaReviewAmt : "-");
-      {
-        char* sp = strstr(amtDisp, " KAS");
-        if (sp) *sp = 0;
-        sp = strstr(amtDisp, " sompi");
-        if (sp) *sp = 0;
-      }
-      gfx->setTextSize(2);
-      gfx->setTextColor(RGB565_WHITE);
-      gfx->setCursor((int16_t)(logoX + logoW + 8), (int16_t)(y + (amtCardH - 16) / 2));
-      gfx->print(amtDisp);
-    }
-    y = (int16_t)(y + amtCardH + sectionGap);
-
-    char destBuf[192];
-    const char* rawDest = g_kaspaReviewDest[0] ? g_kaspaReviewDest : "-";
-    psbt_review_format_dest_chunked(rawDest, destBuf, sizeof(destBuf), 4u);
-    const int16_t destLines = destBuf[0]
-                                ? (int16_t)(psbt_review_measure_dest_h(destBuf, (uint16_t)contentW, addrLineH, 2, chunkGap)
-                                            / addrLineH)
-                                : 1;
-    const int16_t destGlyphH = 16;
-    const int16_t destTextH = (int16_t)((destLines > 1 ? (destLines - 1) * addrLineH : 0) + destGlyphH);
-    const int16_t toCardH = (int16_t)(cardPadTop + destTextH + cardPadBot);
-    psbt_review_draw_section_label("To", y, labelCol);
-    y = (int16_t)(y + labelH + labelToCard);
-    psbt_review_draw_section_card(cardX, y, cardW, toCardH, cardBg, cardBorder);
-    {
-      int16_t ty = (int16_t)(y + cardPadTop);
-      if (destBuf[0]) {
-        char destDraw[192];
-        strncpy(destDraw, destBuf, sizeof(destDraw) - 1);
-        destDraw[sizeof(destDraw) - 1] = 0;
-        psbt_review_draw_dest_quiet(destDraw, gfx, x0, ty, addrLineH, (uint16_t)contentW, 2, chunkGap);
+    if (isMs) {
+      char polName[32] = { 0 };
+      (void)kaspa_imported_multisig_policy_name(polName, sizeof(polName));
+      int8_t cos = 0;
+      if (g_kaspaKpubStatus == 1) cos = 1;
+      else if (g_kaspaKpubStatus == 2) cos = 2;
+      const int16_t badgeH = polName[0] ? 58 : 44;
+      if (crypto_tx_review_section_visible(y, badgeH, contY)) {
+        y = review_draw_multisig_badge(cardX, y, cardW, RGB565_KASPA_TEAL,
+                                       g_kaspaReviewSummary.ms_required, g_kaspaReviewSummary.ms_total,
+                                       cos, polName[0] ? polName : nullptr);
       } else {
-        gfx->setTextSize(2);
-        gfx->setTextColor(RGB565_WHITE);
-        gfx->setCursor(x0, ty);
-        gfx->print(rawDest);
+        y = (int16_t)(y + badgeH + 10);
       }
     }
-    y = (int16_t)(y + toCardH + sectionGap);
 
-    const int16_t chgCardH = 44;
-    if (y + labelH + labelToCard + chgCardH <= maxBottom) {
-      psbt_review_draw_section_label("Change", y, labelCol);
+    {
+      const int16_t amtCardH = 52;
+      const int16_t secH = (int16_t)(labelH + labelToCard + amtCardH);
+      const bool vis = crypto_tx_review_section_visible(y, secH, contY);
+      if (vis) psbt_review_draw_section_label("Amount", y, labelCol);
       y = (int16_t)(y + labelH + labelToCard);
-      psbt_review_draw_section_card(cardX, y, cardW, chgCardH, cardBg, cardBorder);
-      gfx->setCursor(x0, (int16_t)(y + (chgCardH - 16) / 2));
-      if (!hasChange) {
-        gfx->setTextSize(2);
-        gfx->setTextColor(mutedVal);
-        gfx->print("None");
-      } else {
-        char chgDisp[48];
+      if (vis) {
+        psbt_review_draw_section_card(cardX, y, cardW, amtCardH, cardBg, cardBorder);
+        const char* unitLab = g_kaspaReviewUnitSompi ? "sompi" : "KAS";
+        const int16_t chipW = (int16_t)(strlen(unitLab) * 6 + 22);
+        const int16_t chipH = 22;
+        const int16_t chipX = (int16_t)(cardX + cardW - padX - chipW);
+        const int16_t chipY = (int16_t)(y + (amtCardH - chipH) / 2);
+        const int16_t logoX = x0;
+        const int16_t logoY = (int16_t)(y + (amtCardH - logoH) / 2);
+        drawCryptoAssetLogo(logoX, logoY, KASPA_LOGO_RGB565, logoW, logoH, false);
+        BTN_KASPA_UNIT = { chipX, (int16_t)(y + 4), chipW, (int16_t)(amtCardH - 8) };
+        if (g_cryptoTxReviewScrollLite) {
+          gfx->fillRect(chipX, chipY, chipW, chipH, blendRGB565(RGB565_KASPA_TEAL, RGB565_BLACK, 0.68f));
+          gfx->drawRect(chipX, chipY, chipW, chipH, RGB565_KASPA_TEAL);
+        } else {
+          gfx->fillRoundRect(chipX, chipY, chipW, chipH, 5,
+                             blendRGB565(RGB565_KASPA_TEAL, RGB565_BLACK, 0.68f));
+          gfx->drawRoundRect(chipX, chipY, chipW, chipH, 5, RGB565_KASPA_TEAL);
+        }
+        gfx->setTextSize(1);
+        gfx->setTextColor(RGB565_KASPA_TEAL);
+        gfx->setCursor((int16_t)(chipX + 11), (int16_t)(chipY + 7));
+        gfx->print(unitLab);
+
+        char amtDisp[48];
         if (g_kaspaReviewSummaryValid && g_kaspaReviewSummary.ok)
-          kaspa_review_format_amount_line(g_kaspaReviewSummary.change_sompi, chgDisp, sizeof(chgDisp));
+          kaspa_review_format_amount_line(g_kaspaReviewSummary.send_sompi, amtDisp, sizeof(amtDisp));
         else
-          snprintf(chgDisp, sizeof(chgDisp), "%s", g_kaspaReviewChg[0] ? g_kaspaReviewChg : "-");
+          snprintf(amtDisp, sizeof(amtDisp), "%s", g_kaspaReviewAmt[0] ? g_kaspaReviewAmt : "-");
+        {
+          char* sp = strstr(amtDisp, " KAS");
+          if (sp) *sp = 0;
+          sp = strstr(amtDisp, " sompi");
+          if (sp) *sp = 0;
+        }
         gfx->setTextSize(2);
         gfx->setTextColor(RGB565_WHITE);
-        gfx->print(chgDisp);
+        gfx->setCursor((int16_t)(logoX + logoW + 8), (int16_t)(y + (amtCardH - 16) / 2));
+        gfx->print(amtDisp);
+      } else {
+        BTN_KASPA_UNIT = { 0, -200, 0, 0 };
+      }
+      y = (int16_t)(y + amtCardH + sectionGap);
+    }
+
+    {
+      char destBuf[192];
+      const char* rawDest = g_kaspaReviewDest[0] ? g_kaspaReviewDest : "-";
+      psbt_review_format_dest_chunked(rawDest, destBuf, sizeof(destBuf), 4u);
+      const int16_t destLines = destBuf[0]
+                                  ? (int16_t)(psbt_review_measure_dest_h(destBuf, (uint16_t)contentW, addrLineH, 2, chunkGap)
+                                              / addrLineH)
+                                  : 1;
+      const int16_t destTextH = (int16_t)((destLines > 1 ? (destLines - 1) * addrLineH : 0) + destGlyphH);
+      const int16_t toCardH = (int16_t)(cardPadTop + destTextH + cardPadBot);
+      const int16_t secH = (int16_t)(labelH + labelToCard + toCardH);
+      const bool vis = crypto_tx_review_section_visible(y, secH, contY);
+      if (vis) psbt_review_draw_section_label("To", y, labelCol);
+      y = (int16_t)(y + labelH + labelToCard);
+      if (vis) {
+        psbt_review_draw_section_card(cardX, y, cardW, toCardH, cardBg, cardBorder);
+        int16_t ty = (int16_t)(y + cardPadTop);
+        if (destBuf[0]) {
+          char destDraw[192];
+          strncpy(destDraw, destBuf, sizeof(destDraw) - 1);
+          destDraw[sizeof(destDraw) - 1] = 0;
+          psbt_review_draw_dest_quiet(destDraw, gfx, x0, ty, addrLineH, (uint16_t)contentW, 2, chunkGap);
+        } else {
+          gfx->setTextSize(2);
+          gfx->setTextColor(RGB565_WHITE);
+          gfx->setCursor(x0, ty);
+          gfx->print(rawDest);
+        }
+      }
+      y = (int16_t)(y + toCardH + sectionGap);
+    }
+
+    {
+      const int16_t chgCardH = 44;
+      const int16_t secH = (int16_t)(labelH + labelToCard + chgCardH);
+      const bool vis = crypto_tx_review_section_visible(y, secH, contY);
+      if (vis) psbt_review_draw_section_label("Change", y, labelCol);
+      y = (int16_t)(y + labelH + labelToCard);
+      if (vis) {
+        psbt_review_draw_section_card(cardX, y, cardW, chgCardH, cardBg, cardBorder);
+        gfx->setCursor(x0, (int16_t)(y + (chgCardH - 16) / 2));
+        if (!hasChange) {
+          gfx->setTextSize(2);
+          gfx->setTextColor(mutedVal);
+          gfx->print("None");
+        } else {
+          char chgDisp[48];
+          if (g_kaspaReviewSummaryValid && g_kaspaReviewSummary.ok)
+            kaspa_review_format_amount_line(g_kaspaReviewSummary.change_sompi, chgDisp, sizeof(chgDisp));
+          else
+            snprintf(chgDisp, sizeof(chgDisp), "%s", g_kaspaReviewChg[0] ? g_kaspaReviewChg : "-");
+          gfx->setTextSize(2);
+          gfx->setTextColor(RGB565_WHITE);
+          gfx->print(chgDisp);
+        }
       }
       y = (int16_t)(y + chgCardH + sectionGap);
     }
@@ -43196,9 +43580,11 @@ static void drawCryptoReviewKaspaTx() {
       const int16_t addrTextH = (int16_t)((chgLines > 1 ? (chgLines - 1) * addrLineH : 0) + destGlyphH);
       int16_t addrCardH = (int16_t)(cardPadTop + addrTextH + cardPadBot);
       if (addrCardH < 40) addrCardH = 40;
-      if (y + labelH + labelToCard + addrCardH <= maxBottom) {
-        psbt_review_draw_section_label("Change address", y, labelCol);
-        y = (int16_t)(y + labelH + labelToCard);
+      const int16_t secH = (int16_t)(labelH + labelToCard + addrCardH);
+      const bool vis = crypto_tx_review_section_visible(y, secH, contY);
+      if (vis) psbt_review_draw_section_label("Change address", y, labelCol);
+      y = (int16_t)(y + labelH + labelToCard);
+      if (vis) {
         psbt_review_draw_section_card(cardX, y, cardW, addrCardH, cardBg, cardBorder);
         int16_t ay = (int16_t)(y + cardPadTop);
         if (chgAddrBuf[0]) {
@@ -43208,20 +43594,44 @@ static void drawCryptoReviewKaspaTx() {
           psbt_review_draw_dest_quiet(chgDraw, gfx, x0, ay, addrLineH, (uint16_t)contentW, 2, chunkGap);
         }
       }
+      y = (int16_t)(y + addrCardH + sectionGap);
     }
 
-    // Compact wallet status under cards when space allows
-    if (y + 14 < maxBottom) {
+    if (!isMs && crypto_tx_review_section_visible(y, 16, contY)) {
       gfx->setTextSize(1);
-      gfx->setCursor(x0, (int16_t)(maxBottom - 12));
+      gfx->setCursor(x0, y);
       if (g_kaspaKpubStatus == 1) {
         gfx->setTextColor(RGB565_GREEN);
         gfx->print("Wallet verified");
       } else if (g_kaspaKpubStatus == 2) {
         gfx->setTextColor(RGB565_RED);
-        gfx->print("kpub mismatch");
+        gfx->print("Wrong wallet");
       }
+      if (g_kaspaKpubStatus == 1 || g_kaspaKpubStatus == 2) y = (int16_t)(y + 16);
+    } else if (!isMs && (g_kaspaKpubStatus == 1 || g_kaspaKpubStatus == 2)) {
+      y = (int16_t)(y + 16);
     }
+
+    crypto_tx_review_finish_scroll_metrics((int)y, contY);
+    if (g_cryptoTxReviewScrollLite) {
+      esp_task_wdt_reset();
+      yield();
+    }
+  }
+  // Chrome on top — content may paint under Continue (no full-width crop strip).
+  drawTopBar("Review transaction", true);
+  {
+    const Rect& b = BTN_KASPA_REVIEW_CONTINUE;
+    if (g_cryptoTxReviewScrollLite)
+      gfx->fillRect((int16_t)(b.x - 8), (int16_t)(b.y - 8), (int16_t)(b.w + 16), (int16_t)(b.h + 16), RGB565_BLACK);
+    else
+      gfx->fillRoundRect((int16_t)(b.x - 8), (int16_t)(b.y - 8), (int16_t)(b.w + 16), (int16_t)(b.h + 16), 14, RGB565_BLACK);
+  }
+  if (g_msg[0]) {
+    gfx->setTextSize(1);
+    gfx->setTextColor(RGB565_YELLOW);
+    gfx->setCursor(10, (int16_t)(BTN_KASPA_REVIEW_CONTINUE.y - 16));
+    gfx->print(g_msg);
   }
   drawBtn(BTN_KASPA_REVIEW_CONTINUE, "Continue", hasTx ? RGB565_KASPA_TEAL : RGB565_DARKGREY, 2);
   ui_flush();
@@ -43229,7 +43639,7 @@ static void drawCryptoReviewKaspaTx() {
 
 static void drawCryptoKaspaFee(void) {
   gfx->fillScreen(RGB565_BLACK);
-  drawTopBar("Fee", true);
+  drawTopBar(g_psbtSignConfirmActive ? "Confirm signing" : "Fee", true);
   gfx->setTextColor(RGB565_WHITE);
   const int16_t kExplainGap = 10;
   const bool hasTx = (g_kaspaPsktScanLen > 0 && g_kaspaPsktScanBuf[0]);
@@ -43292,7 +43702,9 @@ static void drawCryptoKaspaFee(void) {
       y = crypto_psbt_fee_line_bounds(gfx, 10, y, RGB565_LIGHTGREY, "on-chain value.", kExplainGap);
     }
   }
-  drawBtn(BTN_CRYPTO_REVIEW_SIGN, "NEXT", hasTx ? RGB565_KASPA_TEAL : RGB565_DARKGREY, 2);
+  if (!g_psbtSignConfirmActive) {
+    drawBtn(BTN_CRYPTO_REVIEW_SIGN, "NEXT", hasTx ? RGB565_KASPA_TEAL : RGB565_DARKGREY, 2);
+  }
   drawPsbtSignConfirmOverlay();
   drawPsbtSignCancelConfirmPopup();
   ui_flush();
@@ -43304,7 +43716,8 @@ static bool kaspa_build_signed_ur_from_json(const char* jsonUtf8) {
   const size_t kBuf = CRYPTO_PSBT_SIGNED_UR_BYTES;
   // Keep each fountain frame within QR v16 ECC-L (~586 byte payload / ~560 URI chars).
   const size_t kMaxUri = 560u;
-  size_t frag = (size_t)SP_BC_UR_MAX_FRAGMENT_LEN;
+  size_t frag = bc_ur_initial_frag_for_payload(jlen);
+  if (frag > (size_t)SP_BC_UR_MAX_FRAGMENT_LEN) frag = (size_t)SP_BC_UR_MAX_FRAGMENT_LEN;
   if (frag < 40) frag = 40;
   while (frag >= 40) {
     seedmask_bc_ur_reset();
@@ -43331,6 +43744,125 @@ static bool kaspa_build_signed_ur_from_json(const char* jsonUtf8) {
   return false;
 }
 
+/** Comet-trail ring spinner (no pizza-wedge). */
+static void drawCryptoSigningSpinnerRing(int cx, int cy, int R, uint16_t accent) {
+  const int n = 56;
+  const float twoPi = 6.2831853f;
+  const float halfPi = 1.5707963f;
+  const uint32_t step = millis() / 22;
+  const int head = (int)(step % (uint32_t)n);
+  const uint16_t track = blendRGB565(RGB565_BLACK, RGB565_WHITE, 0.14f);
+  for (int i = 0; i < n; i++) {
+    float ang = (float)i * twoPi / (float)n - halfPi;
+    int px = (int)((float)cx + (float)R * cosf(ang) + 0.5f);
+    int py = (int)((float)cy + (float)R * sinf(ang) + 0.5f);
+    gfx->fillCircle(px, py, 1, track);
+  }
+  for (int t = 0; t < 16; t++) {
+    int i = (head - t + n * 8) % n;
+    float ang = (float)i * twoPi / (float)n - halfPi;
+    int px = (int)((float)cx + (float)R * cosf(ang) + 0.5f);
+    int py = (int)((float)cy + (float)R * sinf(ang) + 0.5f);
+    float bright = 1.0f - (float)t / 16.0f;
+    int rad = (t == 0) ? 3 : ((t < 4) ? 2 : 1);
+    uint16_t col = blendRGB565(RGB565_BLACK, accent, 0.18f + 0.82f * bright);
+    gfx->fillCircle(px, py, rad, col);
+  }
+}
+
+/** Slide-commit signing screen — quiet layout, ASCII only. */
+static void drawCryptoSigningProgressChrome(bool kaspa) {
+  const uint16_t accent = kaspa ? RGB565_KASPA_TEAL : RGB565_BITCOIN_ORANGE;
+  gfx->fillScreen(RGB565_BLACK);
+  drawTopBar("Confirm signing", true);
+
+  const int cx = LCD_W / 2;
+  const int cy = 210;
+  drawCryptoSigningSpinnerRing(cx, cy, 34, accent);
+
+  gfx->setTextSize(2);
+  gfx->setTextColor(RGB565_WHITE);
+  const char* line1 = "Signing";
+  int w1 = (int)strlen(line1) * 12;
+  gfx->setCursor((LCD_W - w1) / 2, 280);
+  gfx->print(line1);
+
+  gfx->setTextSize(1);
+  gfx->setTextColor(RGB565_LIGHTGREY);
+  const char* line2 = "Please wait";
+  int w2 = (int)strlen(line2) * 6;
+  gfx->setCursor((LCD_W - w2) / 2, 310);
+  gfx->print(line2);
+
+  ui_flush();
+}
+
+static void crypto_sign_finish_ui(void) {
+  const bool kaspa = g_cryptoSignWasKaspa;
+  // Stop spinner paints before any other screen draw (concurrent gfx was rebooting on fast fail paths).
+  g_cryptoSignInProgress = false;
+  vTaskDelay(pdMS_TO_TICKS(40));
+  g_psbtSlideSuppressSwipeBackUntil = millis() + PSBT_SLIDE_POST_COMMIT_SWIPE_BLOCK_MS;
+  g_psbtSlideCommitBlocksSwipeBack = true;
+  if (kaspa) {
+    if (g_kaspaHasSigned) {
+      g_psbtSignConfirmActive = false;
+      g_psbtVisualizeActive = false;
+      psbt_slide_reset();
+      show(UIScreen::CRYPTO_KASPA_SIGNED_QR);
+      g_touchIgnoreUntil = millis() + 500;
+    } else {
+      psbt_slide_reset();
+      g_psbtSignConfirmActive = true;
+      g_psbtSlideCommitBlocksSwipeBack = false;
+      draw();
+    }
+  } else {
+    if (g_cryptoHasSigned) {
+      g_psbtSignConfirmActive = false;
+      g_psbtVisualizeActive = false;
+      psbt_slide_reset();
+      show(UIScreen::CRYPTO_SIGNED_QR);
+      g_touchIgnoreUntil = millis() + 500;
+    } else {
+      psbt_slide_reset();
+      g_psbtSignConfirmActive = true;
+      g_psbtSlideCommitBlocksSwipeBack = false;
+      draw();
+    }
+  }
+}
+
+/** Yields every frame so idle/TWDT stay happy; only paints while a sign is in progress. */
+static void crypto_sign_spinner_task(void* /*arg*/) {
+  for (;;) {
+    if (g_cryptoSignInProgress) {
+      drawCryptoSigningProgressChrome(g_cryptoSignWasKaspa);
+    }
+    vTaskDelay(pdMS_TO_TICKS(28));
+  }
+}
+
+/** Sign on this thread (stable); spinner task on the other core keeps the ring moving. */
+static bool crypto_sign_start_background(bool kaspa) {
+  if (g_cryptoSignInProgress) return false;
+  // Fail closed before spinner/sign — avoids reboot races on known-bad wallets/policies.
+  if (kaspa && !kaspa_accept_loaded_unsigned_for_wallet()) {
+    g_psbtSlideCommitBlocksSwipeBack = false;
+    psbt_slide_reset();
+    g_psbtSignConfirmActive = true;
+    draw();
+    return false;
+  }
+  g_cryptoSignWasKaspa = kaspa;
+  g_cryptoSignInProgress = true;
+  vTaskDelay(pdMS_TO_TICKS(40));
+  if (kaspa) kaspa_run_sign(/*navigateUi=*/false);
+  else crypto_build_signed_psbt_from_scanned();
+  crypto_sign_finish_ui();
+  return true;
+}
+
 static void drawCryptoKaspaSignedQr() {
   gfx->fillScreen(RGB565_BLACK);
   drawTopBar("Signed Kaspa tx", true);
@@ -43349,91 +43881,97 @@ static void drawCryptoKaspaSignedQr() {
   const int16_t qReserve = KASPA_SIGNED_QR_BOTTOM_RESERVE;
   gfx->setTextColor(RGB565_LIGHTGREY);
   gfx->setTextSize(1);
-  gfx->setCursor(10, 48);
   const bool fountain = g_kaspaSignedUrFountain && g_cryptoPsbtSignedUr && g_cryptoPsbtSignedUr[0];
   if (fountain) {
-    gfx->print("Fountain UR — hold steady for Mac scan");
+    const char* tip = "Animated UR - Hold steady for scan";
+    gfx->setCursor((LCD_W - (int)strlen(tip) * 6) / 2, 48);
+    gfx->print(tip);
     const QrCode& kaspaSignedQr = QrCode::encodeText(g_cryptoPsbtSignedUr, QrCode::Ecc::ECC_LOW);
     drawQRCodeAt(kaspaSignedQr, qy, qBorder, qReserve);
     const int kaspaSignedQrBottom = qy + qrCodeDrawnSize(kaspaSignedQr, qy, qBorder, qReserve);
     gfx->setTextColor(RGB565_WHITE);
     gfx->setTextSize(1);
-    gfx->setCursor(10, kaspaSignedQrBottom + 2);
-    gfx->printf("seq %lu/%lu %s (%u char)",
-                (unsigned long)seedmask_bc_ur_seq_num(), (unsigned long)seedmask_bc_ur_seq_len(),
-                g_kaspaSignedQrAnimPaused ? "PAUSED" : "SCAN",
-                (unsigned)strlen(g_cryptoPsbtSignedUr));
+    char seqLine[48];
+    snprintf(seqLine, sizeof(seqLine), "%lu/%lu %s (%u char)",
+             (unsigned long)seedmask_bc_ur_seq_num(), (unsigned long)seedmask_bc_ur_seq_len(),
+             g_kaspaSignedQrAnimPaused ? "PAUSED" : "SCAN",
+             (unsigned)strlen(g_cryptoPsbtSignedUr));
+    gfx->setCursor((LCD_W - (int)strlen(seqLine) * 6) / 2, kaspaSignedQrBottom + 2);
+    gfx->print(seqLine);
   } else {
-    gfx->print("Scan with Mac coordinator to broadcast.");
+    const char* tip = "Scan with Mac coordinator to broadcast.";
+    gfx->setCursor((LCD_W - (int)strlen(tip) * 6) / 2, 48);
+    gfx->print(tip);
     const QrCode& kaspaSignedQr = QrCode::encodeText(g_kaspaSignedJson, QrCode::Ecc::ECC_LOW);
     drawQRCodeAt(kaspaSignedQr, qy, qBorder, qReserve);
     const int kaspaSignedQrBottom = qy + qrCodeDrawnSize(kaspaSignedQr, qy, qBorder, qReserve);
     gfx->setTextColor(RGB565_WHITE);
     gfx->setTextSize(1);
-    gfx->setCursor(10, kaspaSignedQrBottom + 2);
-    gfx->printf("(%u char)", (unsigned)strlen(g_kaspaSignedJson));
+    char charLine[24];
+    snprintf(charLine, sizeof(charLine), "(%u char)", (unsigned)strlen(g_kaspaSignedJson));
+    gfx->setCursor((LCD_W - (int)strlen(charLine) * 6) / 2, kaspaSignedQrBottom + 2);
+    gfx->print(charLine);
   }
   drawBtn(BTN_KASPA_SIGNED_SAVE, "Save transaction", UI_CARD, 2);
   drawBtn(BTN_KASPA_SIGNED_BACK, "BACK", RGB565_DARKGREY, 2);
+  drawCryptoTxSaveFeedbackCard();
   ui_flush();
 }
 
-static void kaspa_run_sign() {
+static void kaspa_run_sign(bool navigateUi) {
 #if SEEDMASK_KASPA_SELFTEST_ON_BOOT
   if (!g_kaspaSighashSelftestRan || !g_kaspaBip340SelftestRan) {
-    setMsg("Kaspa tests still running…");
-    draw();
+    setMsg("Kaspa tests still running...");
+    if (navigateUi) draw();
     return;
   }
   if (!g_kaspaSighashSelftestOk) {
     setMsg(g_kaspaSighashSelftestErr[0] ? g_kaspaSighashSelftestErr : "Kaspa sighash test failed");
-    draw();
+    if (navigateUi) draw();
     return;
   }
   if (!g_kaspaBip340SelftestOk) {
     setMsg(g_kaspaBip340SelftestErr[0] ? g_kaspaBip340SelftestErr : "Schnorr self-test failed — reflash");
-    draw();
+    if (navigateUi) draw();
     return;
   }
 #endif
   if (!g_kaspaPsktScanLen || !g_kaspaPsktScanBuf[0]) {
     setMsg("No Kaspa tx loaded");
-    draw();
+    if (navigateUi) draw();
     return;
   }
   kaspa_review_refresh_kpub_status();
   if (g_kaspaKpubStatus == 2) {
     setMsg("kpub does not match this device");
-    draw();
+    if (navigateUi) draw();
     return;
   }
   (void)kaspa_extract_unsigned_payload(g_kaspaPsktScanBuf, &g_kaspaPsktScanLen, KASPA_PSKT_SCAN_MAX);
   if (!seedmask_kaspa_unsigned_is_v2(g_kaspaPsktScanBuf, g_kaspaPsktScanLen)) {
     setMsg("Need JSON version 2");
-    draw();
+    if (navigateUi) draw();
     return;
   }
-  if ((strstr(g_kaspaPsktScanBuf, "\"redeem_script_hex\"") || strstr(g_kaspaPsktScanBuf, "\"redeemScript\""))
+  if (seedmask_kaspa_unsigned_has_multisig_redeem(g_kaspaPsktScanBuf, g_kaspaPsktScanLen)
       && g_kaspaMultisigPolicyMode != KaspaMultisigPolicyMode::SKIP_VERIFICATION
       && !kaspa_has_imported_multisig_policy_for_current_account()) {
     setMsg(g_kaspaMultisigPolicyMode == KaspaMultisigPolicyMode::REQUIRE_EXISTING ? "Policy required"
                                                                                    : "Import multisig policy?");
-    draw();
+    if (navigateUi) draw();
     return;
   }
   if (!ensure_bip39_derived_seed_cached()) {
     setMsg(g_addrLastErr[0] ? g_addrLastErr : "Seed not ready");
-    draw();
+    if (navigateUi) draw();
     return;
   }
-  setMsg("Signing Kaspa tx…");
-  // Avoid redrawing Fee under a dismissed confirm — caller keeps confirm / handles UI.
   uint8_t activeWc = 0;
   const char(*activeWords)[16] = active_crypto_seed_words(&activeWc);
   char mnemonic[256];
   if (!build_mnemonic_string(activeWords, activeWc, mnemonic, sizeof(mnemonic))) {
     setMsg("mnemonic");
-    draw();
+    if (navigateUi) draw();
     return;
   }
   char err[128] = { 0 };
@@ -43475,18 +44013,15 @@ static void kaspa_run_sign() {
     } else {
       setMsg(err[0] ? err : "Kaspa sign failed");
     }
-    draw();
+    if (navigateUi) draw();
     return;
   }
   secure_memzero(mnemonic, sizeof(mnemonic));
   g_kaspaHasSigned = true;
   g_kaspaSignedUrFountain = false;
-  if (kaspa_build_signed_ur_from_json(g_kaspaSignedJson)) {
-    setMsg(g_kaspaSignedUrFountain ? "Signed — scan animated QR on Mac" : "Signed — scan QR on Mac");
-  } else {
-    setMsg("Signed — scan QR on Mac");
-  }
-  show(UIScreen::CRYPTO_KASPA_SIGNED_QR);
+  (void)kaspa_build_signed_ur_from_json(g_kaspaSignedJson);
+  setMsg("");
+  if (navigateUi) show(UIScreen::CRYPTO_KASPA_SIGNED_QR);
 }
 
 static void handleCryptoScanKaspaPsktTap(uint16_t x, uint16_t y) {
@@ -43515,6 +44050,8 @@ static void handleCryptoReviewKaspaTxTap(uint16_t x, uint16_t y) {
     if (!g_kaspaPsktScanLen || !g_kaspaPsktScanBuf[0]) {
       setMsg("No Kaspa tx scanned");
       draw();
+    } else if (!kaspa_accept_loaded_unsigned_for_wallet()) {
+      draw();
     } else {
       show(UIScreen::CRYPTO_KASPA_FEE);
     }
@@ -43523,6 +44060,15 @@ static void handleCryptoReviewKaspaTxTap(uint16_t x, uint16_t y) {
   if (hit(BTN_TOP_BURGER, x, y)) {
     show(UIScreen::CRYPTO_HOME);
     return;
+  }
+  // Arm scroll only when content overflows (measured on last draw).
+  if (crypto_tx_review_can_scroll() && y >= 48 && y < BTN_KASPA_REVIEW_CONTINUE.y) {
+    g_cryptoTxReviewTouchPending = true;
+    g_cryptoTxReviewScrolling = false;
+    g_cryptoTxReviewDidDrag = false;
+    g_cryptoTxReviewDownX = (int16_t)x;
+    g_cryptoTxReviewDownY = (int16_t)y;
+    g_cryptoTxReviewDragLastY = -1;
   }
 }
 
@@ -43592,7 +44138,13 @@ static void handleCryptoKaspaFeeTap(uint16_t x, uint16_t y) {
 
 static void handleCryptoKaspaSignedQrTap(uint16_t x, uint16_t y) {
   if (hit(BTN_KASPA_SIGNED_SAVE, x, y)) {
-    if (crypto_save_signed_kaspa_to_sd()) draw();
+    (void)crypto_save_signed_kaspa_to_sd();
+    draw();
+    if (!crypto_tx_save_feedback_active() && g_msg[0]) {
+      menu_draw_message_card_overlay();
+      ui_flush();
+    }
+    g_touchIgnoreUntil = millis() + 350;
     return;
   }
   if (hit(BTN_KASPA_SIGNED_BACK, x, y) || hit(BTN_TOP_BURGER, x, y)) {
@@ -43624,15 +44176,34 @@ static void drawCryptoScanPsbt() {
   ui_flush();
 }
 
-// PSBT review: insert spaces every `group` chars (after optional " (+n)" suffix is preserved).
+// Review screens: insert spaces every `group` chars (optional " (+n)" suffix preserved).
+// Kaspa matches Coordinator: keep "kaspa:" intact, chunk only the body → "kaspa:qqh5 9z4t …".
 static void psbt_review_format_dest_chunked(const char* src, char* out, size_t outCap, unsigned group) {
   if (!src || !out || outCap < 8) return;
   out[0] = 0;
+  if (group < 1) group = 4;
   const char* suffix = strstr(src, " (+");
   size_t mainLen = suffix ? (size_t)(suffix - src) : strlen(src);
   size_t wi = 0;
+  size_t bodyStart = 0;
+  if (mainLen >= 6) {
+    static const char kPref[] = "kaspa:";
+    bool isKaspa = true;
+    for (size_t i = 0; i < 6; i++) {
+      char c = src[i];
+      if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
+      if (c != kPref[i]) {
+        isKaspa = false;
+        break;
+      }
+    }
+    if (isKaspa) {
+      for (size_t i = 0; i < 6 && wi + 1 < outCap; i++) out[wi++] = src[i];
+      bodyStart = 6;
+    }
+  }
   unsigned cc = 0;
-  for (size_t i = 0; i < mainLen && wi + 3 < outCap; i++) {
+  for (size_t i = bodyStart; i < mainLen && wi + 3 < outCap; i++) {
     char c = src[i];
     if (c == ' ') continue;
     if (cc > 0 && (cc % group) == 0 && wi + 1 < outCap) out[wi++] = ' ';
@@ -43862,6 +44433,45 @@ static void psbt_slide_reset(void) {
   g_psbtSlideDragPaintMs = 0;
   g_psbtSlideDragReleaseStartMs = 0;
   g_psbtSlideFilteredX = -1.f;
+}
+
+/** True if thumb is far enough right to count as completed (release or reach-end). */
+static bool psbt_slide_past_commit_threshold(void) {
+  int16_t maxO = psbt_slide_max_offset();
+  if (maxO <= 0) return false;
+  // ~50% of travel — digitizer + slew often leave the thumb short of the rail end on lift.
+  int16_t thresh = (int16_t)(((int32_t)maxO * (int32_t)50) / (int32_t)100);
+  return g_psbtSlideThumbOffset >= thresh;
+}
+
+/** Finger is over the right portion of the slide track (commit zone). */
+static bool psbt_slide_finger_in_commit_zone(uint16_t sx) {
+  const int16_t commitX =
+    (int16_t)(PSBT_SLIDE_TRACK_X + ((int32_t)PSBT_SLIDE_TRACK_W * 62) / 100);
+  return (int16_t)sx >= commitX;
+}
+
+/** Snap thumb to end and run Kaspa/Bitcoin sign. On failure, reset the slide (do not glue it). */
+static bool psbt_slide_commit_sign(void) {
+  if (!g_psbtSignConfirmActive) return false;
+  if (g_screen != UIScreen::CRYPTO_KASPA_FEE && g_screen != UIScreen::CRYPTO_PSBT_FEE) return false;
+  g_psbtSlideSuppressSwipeBackUntil = millis() + PSBT_SLIDE_POST_COMMIT_SWIPE_BLOCK_MS;
+  g_psbtSlideCommitBlocksSwipeBack = true;
+  g_cryptoAutoSignPending = false;
+  g_psbtSlideDragging = false;
+  g_psbtSlideAwaitSwipe = false;
+  g_psbtSlideDragReleaseStartMs = 0;
+  {
+    int16_t maxO = psbt_slide_max_offset();
+    if (maxO > 0) g_psbtSlideThumbOffset = maxO;
+  }
+  // Immediate Signing chrome + background crypto so the spinner keeps moving.
+  if (g_screen == UIScreen::CRYPTO_KASPA_FEE) {
+    (void)crypto_sign_start_background(true);
+  } else {
+    (void)crypto_sign_start_background(false);
+  }
+  return true;
 }
 
 /// Expanded hit area (thumb + padded track). Slide used to fail when touch-down lived only behind
@@ -44460,12 +45070,10 @@ static void drawPsbtSignConfirmOverlay(void) {
   const uint16_t accent = kaspaFee ? RGB565_KASPA_TEAL : RGB565_BITCOIN_ORANGE;
   // Full content area below top bar + accent (46px); match Review/Fee edge-to-edge panel (LCD_H).
   gfx->fillRect(0, 46, LCD_W, LCD_H - 46, RGB565(10, 10, 14));
-  gfx->setTextColor(RGB565_WHITE);
-  gfx->setTextSize(2);
-  gfx->setCursor(10, 54);
-  gfx->print("Confirm signing");
+  // Title lives in the top bar only ("Confirm signing") — no duplicate heading here.
   gfx->setTextSize(1);
-  int16_t ly = 82;
+  gfx->setTextColor(RGB565_WHITE);
+  int16_t ly = 56;
   const char* sb = g_psbtSignConfirmBody;
   const int wrapChars = 38;
   size_t slen = strlen(sb);
@@ -44487,6 +45095,29 @@ static void drawPsbtSignConfirmOverlay(void) {
   drawBtn(BTN_PSBT_SIGN_CONF_VISUALIZE, "Visualize",
           blendRGB565(accent, RGB565_BLACK, 0.15f), 1);
   drawBtn(BTN_PSBT_SIGN_CONF_CANCEL, "CANCEL", RGB565_RED, 2);
+  // Sign errors land in g_msg — must be visible on this overlay (Fee screen is covered).
+  if (g_msg[0]
+      && strncmp(g_msg, "Signing ", 8) != 0
+      && strncmp(g_msg, "slide", 5) != 0) {
+    gfx->setTextSize(1);
+    gfx->setTextColor(RGB565_YELLOW);
+    const int wrapChars = 36;
+    size_t mlen = strlen(g_msg);
+    size_t mpos = 0;
+    int16_t my = 248;
+    while (mpos < mlen && my < 300) {
+      size_t take = mlen - mpos;
+      if (take > (size_t)wrapChars) take = (size_t)wrapChars;
+      char chunk[40];
+      if (take >= sizeof(chunk)) take = sizeof(chunk) - 1;
+      memcpy(chunk, g_msg + mpos, take);
+      chunk[take] = 0;
+      gfx->setCursor(10, my);
+      gfx->print(chunk);
+      my = (int16_t)(my + 12);
+      mpos += take;
+    }
+  }
   {
     const int16_t maxO = psbt_slide_max_offset();
     int16_t off = g_psbtSlideThumbOffset;
@@ -44542,12 +45173,8 @@ static int16_t psbt_review_draw_dest_quiet(char* chunkedMut, Arduino_Canvas* g, 
   if (textSize < 1) textSize = 1;
   if (chunkGapPx < 2) chunkGapPx = 2;
   g->setTextSize(textSize);
-  auto textW = [&](const char* s) -> uint16_t {
-    int16_t x1 = 0, y1 = 0;
-    uint16_t w = 0, h = 0;
-    g->getTextBounds(s, 0, 0, &x1, &y1, &w, &h);
-    return w;
-  };
+  // Default GFX font: fixed 6px * textSize — avoid getTextBounds (very hot on scroll redraws).
+  const uint16_t cw = (uint16_t)(6u * (uint16_t)textSize);
   char* saveptr = nullptr;
   char* tok = strtok_r(chunkedMut, " ", &saveptr);
   unsigned idx = 0;
@@ -44555,14 +45182,17 @@ static int16_t psbt_review_draw_dest_quiet(char* chunkedMut, Arduino_Canvas* g, 
   int16_t cy = y0;
   while (tok) {
     uint16_t spw = (cx > x0) ? (uint16_t)chunkGapPx : 0;
-    uint16_t wTok = textW(tok);
+    uint16_t wTok = (uint16_t)(strlen(tok) * cw);
     if (cx > x0 && (uint32_t)(cx - x0) + spw + wTok > maxLinePx) {
       cx = x0;
       cy = (int16_t)(cy + lineH);
       continue;
     }
     if (cx > x0) cx = (int16_t)(cx + (int16_t)spw);
-    g->setTextColor(((idx % 2u) == 0u) ? RGB565_WHITE : blendRGB565(RGB565_WHITE, RGB565_BLACK, 0.16f));
+    if (g_cryptoTxReviewScrollLite)
+      g->setTextColor(RGB565_WHITE);
+    else
+      g->setTextColor(((idx % 2u) == 0u) ? RGB565_WHITE : blendRGB565(RGB565_WHITE, RGB565_BLACK, 0.16f));
     g->setCursor(cx, cy);
     g->print(tok);
     cx = (int16_t)(cx + (int16_t)wTok);
@@ -44581,20 +45211,14 @@ static int16_t psbt_review_measure_dest_h(const char* chunked, uint16_t maxLineP
   work[sizeof(work) - 1] = 0;
   if (textSize < 1) textSize = 1;
   if (chunkGapPx < 2) chunkGapPx = 2;
-  gfx->setTextSize(textSize);
-  auto textW = [&](const char* s) -> uint16_t {
-    int16_t x1 = 0, y1 = 0;
-    uint16_t w = 0, h = 0;
-    gfx->getTextBounds(s, 0, 0, &x1, &y1, &w, &h);
-    return w;
-  };
+  const uint16_t cw = (uint16_t)(6u * (uint16_t)textSize);
   char* saveptr = nullptr;
   char* tok = strtok_r(work, " ", &saveptr);
   int16_t cx = 0;
   int16_t lines = 1;
   while (tok) {
     uint16_t spw = (cx > 0) ? (uint16_t)chunkGapPx : 0;
-    uint16_t wTok = textW(tok);
+    uint16_t wTok = (uint16_t)(strlen(tok) * cw);
     if (cx > 0 && (uint32_t)cx + spw + wTok > maxLinePx) {
       cx = 0;
       lines++;
@@ -44609,6 +45233,11 @@ static int16_t psbt_review_measure_dest_h(const char* chunked, uint16_t maxLineP
 
 static void psbt_review_draw_section_card(int16_t x, int16_t y, int16_t w, int16_t h,
                                          uint16_t bg, uint16_t border) {
+  if (g_cryptoTxReviewScrollLite) {
+    gfx->fillRect(x, y, w, h, bg);
+    gfx->drawRect(x, y, w, h, border);
+    return;
+  }
   gfx->fillRoundRect(x, y, w, h, 10, bg);
   gfx->drawRoundRect(x, y, w, h, 10, border);
 }
@@ -44624,9 +45253,10 @@ static void psbt_review_draw_section_label(const char* lab, int16_t y, uint16_t 
 
 static void drawCryptoReviewPsbt() {
   gfx->fillScreen(RGB565_BLACK);
-  drawTopBar("Review transaction", true);
   gfx->setTextColor(RGB565_WHITE);
+  const int16_t contY = BTN_CRYPTO_REVIEW_PSBT_NEXT.y;
   if (!g_cryptoHasUnsigned) {
+    drawTopBar("Review transaction", true);
     gfx->setTextSize(2);
     gfx->setCursor(14, 100);
     gfx->setTextColor(blendRGB565(RGB565_WHITE, RGB565_BLACK, 0.30f));
@@ -44646,127 +45276,151 @@ static void drawCryptoReviewPsbt() {
     const int16_t padX = 10;
     const int16_t contentW = (int16_t)(cardW - 2 * padX);
     const int16_t sectionGap = 14;
-    const int16_t labelH = 8;       // size-1 text height
-    const int16_t labelToCard = 3;  // keep labels close to their cards
+    const int16_t labelH = 8;
+    const int16_t labelToCard = 3;
     const int16_t cardPadTop = 10;
-    const int16_t cardPadBot = 14;  // extra bottom so last address line stays inside
-    const int16_t addrLineH = 22;   // size-2 glyph 16 + vertical breathing room
-    const int16_t chunkGap = 8;     // fits ~5×4-char groups per line
-    const int16_t maxBottom = (int16_t)(BTN_CRYPTO_REVIEW_PSBT_NEXT.y - 10);
+    const int16_t cardPadBot = 14;
+    const int16_t addrLineH = 22;
+    const int16_t destGlyphH = 16;
+    const int16_t chunkGap = 8;
     const int16_t x0 = (int16_t)(cardX + padX);
 
     const bool hasChange = g_cryptoReviewSummaryValid && g_cryptoReviewSummary.ok
                            && g_cryptoReviewSummary.change_sat > 0;
     const bool hasChgAddr = hasChange && g_cryptoReviewChgAddr[0] != 0;
+    const bool isMs = g_cryptoReviewSummaryValid && g_cryptoReviewSummary.ok && g_cryptoReviewSummary.is_multisig;
 
     const int16_t logoW = (int16_t)BITCOIN_LOGO_MENU_RGB565_W;
     const int16_t logoH = (int16_t)BITCOIN_LOGO_MENU_RGB565_H;
 
-    int16_t y = 54;
+    crypto_tx_review_clamp_scroll();
+    int16_t y = (int16_t)(54 + g_cryptoTxReviewScrollY);
 
-    // ----- Amount -----
-    psbt_review_draw_section_label("Amount", y, labelCol);
-    y = (int16_t)(y + labelH + labelToCard);
-    const int16_t amtCardH = 52;
-    psbt_review_draw_section_card(cardX, y, cardW, amtCardH, cardBg, cardBorder);
-    {
-      const char* unitLab = g_psbtReviewUnitSats ? "sats" : "BTC";
-      const int16_t chipW = (int16_t)(strlen(unitLab) * 6 + 22);
-      const int16_t chipH = 22;
-      const int16_t chipX = (int16_t)(cardX + cardW - padX - chipW);
-      const int16_t chipY = (int16_t)(y + (amtCardH - chipH) / 2);
-      const int16_t logoX = x0;
-      const int16_t logoY = (int16_t)(y + (amtCardH - logoH) / 2);
-      drawCryptoAssetLogo(logoX, logoY, BITCOIN_LOGO_MENU_RGB565, logoW, logoH, false);
-
-      BTN_PSBT_BITCOIN_UNIT = { chipX, (int16_t)(y + 4), chipW, (int16_t)(amtCardH - 8) };
-      gfx->fillRoundRect(chipX, chipY, chipW, chipH, 5,
-                         blendRGB565(RGB565_BITCOIN_ORANGE, RGB565_BLACK, 0.68f));
-      gfx->drawRoundRect(chipX, chipY, chipW, chipH, 5, RGB565_BITCOIN_ORANGE);
-      gfx->setTextSize(1);
-      gfx->setTextColor(RGB565_BITCOIN_ORANGE);
-      gfx->setCursor((int16_t)(chipX + 11), (int16_t)(chipY + 7));
-      gfx->print(unitLab);
-
-      char amtDisp[48];
-      if (g_cryptoReviewSummaryValid && g_cryptoReviewSummary.ok)
-        psbt_review_format_amount_line(g_cryptoReviewSummary.send_sat, amtDisp, sizeof(amtDisp));
-      else
-        snprintf(amtDisp, sizeof(amtDisp), "%s", g_cryptoReviewAmt[0] ? g_cryptoReviewAmt : "-");
-      {
-        char* sp = strstr(amtDisp, " BTC");
-        if (sp) *sp = 0;
-        sp = strstr(amtDisp, " sats");
-        if (sp) *sp = 0;
-      }
-      gfx->setTextSize(2);
-      gfx->setTextColor(RGB565_WHITE);
-      const int16_t amtX = (int16_t)(logoX + logoW + 8);
-      const int16_t amtY = (int16_t)(y + (amtCardH - 16) / 2);
-      gfx->setCursor(amtX, amtY);
-      gfx->print(amtDisp);
-    }
-    y = (int16_t)(y + amtCardH + sectionGap);
-
-    // ----- To -----
-    char destBuf[192];
-    const char* rawDest = g_cryptoReviewDest[0] ? g_cryptoReviewDest : "-";
-    psbt_review_format_dest_chunked(rawDest, destBuf, sizeof(destBuf), 4u);
-    // Height to the bottom of the last glyph (not a full trailing line advance).
-    const int16_t destLines = destBuf[0]
-                                ? (int16_t)(psbt_review_measure_dest_h(destBuf, (uint16_t)contentW, addrLineH, 2, chunkGap)
-                                            / addrLineH)
-                                : 1;
-    const int16_t destGlyphH = 16;  // size-2
-    const int16_t destTextH = (int16_t)((destLines > 1 ? (destLines - 1) * addrLineH : 0) + destGlyphH);
-    // Never shrink below content — clamping was clipping the last To address line.
-    const int16_t toCardH = (int16_t)(cardPadTop + destTextH + cardPadBot);
-
-    psbt_review_draw_section_label("To", y, labelCol);
-    y = (int16_t)(y + labelH + labelToCard);
-    psbt_review_draw_section_card(cardX, y, cardW, toCardH, cardBg, cardBorder);
-    {
-      int16_t ty = (int16_t)(y + cardPadTop);
-      if (destBuf[0]) {
-        char destDraw[192];
-        strncpy(destDraw, destBuf, sizeof(destDraw) - 1);
-        destDraw[sizeof(destDraw) - 1] = 0;
-        psbt_review_draw_dest_quiet(destDraw, gfx, x0, ty, addrLineH, (uint16_t)contentW, 2, chunkGap);
+    if (isMs) {
+      char polName[32] = { 0 };
+      (void)btc_imported_multisig_policy_name(polName, sizeof(polName));
+      const int16_t badgeH = polName[0] ? 58 : 44;
+      if (crypto_tx_review_section_visible(y, badgeH, contY)) {
+        y = review_draw_multisig_badge(cardX, y, cardW, RGB565_BITCOIN_ORANGE,
+                                       g_cryptoReviewSummary.ms_required, g_cryptoReviewSummary.ms_total,
+                                       g_cryptoReviewSummary.device_is_cosigner,
+                                       polName[0] ? polName : nullptr);
       } else {
-        gfx->setTextSize(2);
-        gfx->setTextColor(RGB565_WHITE);
-        gfx->setCursor(x0, ty);
-        gfx->print(rawDest[0] ? rawDest : "-");
+        y = (int16_t)(y + badgeH + 10);
       }
     }
-    y = (int16_t)(y + toCardH + sectionGap);
 
-    // ----- Change -----
-    const int16_t chgCardH = 44;
-    if (y + labelH + labelToCard + chgCardH <= maxBottom) {
-      psbt_review_draw_section_label("Change", y, labelCol);
+    {
+      const int16_t amtCardH = 52;
+      const int16_t secH = (int16_t)(labelH + labelToCard + amtCardH);
+      const bool vis = crypto_tx_review_section_visible(y, secH, contY);
+      if (vis) psbt_review_draw_section_label("Amount", y, labelCol);
       y = (int16_t)(y + labelH + labelToCard);
-      psbt_review_draw_section_card(cardX, y, cardW, chgCardH, cardBg, cardBorder);
-      gfx->setCursor(x0, (int16_t)(y + (chgCardH - 16) / 2));
-      if (!hasChange) {
-        gfx->setTextSize(2);
-        gfx->setTextColor(mutedVal);
-        gfx->print("None");
-      } else if (g_cryptoReviewSummaryValid && g_cryptoReviewSummary.ok) {
-        char chgDisp[48];
-        psbt_review_format_amount_line(g_cryptoReviewSummary.change_sat, chgDisp, sizeof(chgDisp));
+      if (vis) {
+        psbt_review_draw_section_card(cardX, y, cardW, amtCardH, cardBg, cardBorder);
+        const char* unitLab = g_psbtReviewUnitSats ? "sats" : "BTC";
+        const int16_t chipW = (int16_t)(strlen(unitLab) * 6 + 22);
+        const int16_t chipH = 22;
+        const int16_t chipX = (int16_t)(cardX + cardW - padX - chipW);
+        const int16_t chipY = (int16_t)(y + (amtCardH - chipH) / 2);
+        const int16_t logoX = x0;
+        const int16_t logoY = (int16_t)(y + (amtCardH - logoH) / 2);
+        drawCryptoAssetLogo(logoX, logoY, BITCOIN_LOGO_MENU_RGB565, logoW, logoH, false);
+        BTN_PSBT_BITCOIN_UNIT = { chipX, (int16_t)(y + 4), chipW, (int16_t)(amtCardH - 8) };
+        if (g_cryptoTxReviewScrollLite) {
+          gfx->fillRect(chipX, chipY, chipW, chipH, blendRGB565(RGB565_BITCOIN_ORANGE, RGB565_BLACK, 0.68f));
+          gfx->drawRect(chipX, chipY, chipW, chipH, RGB565_BITCOIN_ORANGE);
+        } else {
+          gfx->fillRoundRect(chipX, chipY, chipW, chipH, 5,
+                             blendRGB565(RGB565_BITCOIN_ORANGE, RGB565_BLACK, 0.68f));
+          gfx->drawRoundRect(chipX, chipY, chipW, chipH, 5, RGB565_BITCOIN_ORANGE);
+        }
+        gfx->setTextSize(1);
+        gfx->setTextColor(RGB565_BITCOIN_ORANGE);
+        gfx->setCursor((int16_t)(chipX + 11), (int16_t)(chipY + 7));
+        gfx->print(unitLab);
+
+        char amtDisp[48];
+        if (g_cryptoReviewSummaryValid && g_cryptoReviewSummary.ok)
+          psbt_review_format_amount_line(g_cryptoReviewSummary.send_sat, amtDisp, sizeof(amtDisp));
+        else
+          snprintf(amtDisp, sizeof(amtDisp), "%s", g_cryptoReviewAmt[0] ? g_cryptoReviewAmt : "-");
+        {
+          char* sp = strstr(amtDisp, " BTC");
+          if (sp) *sp = 0;
+          sp = strstr(amtDisp, " sats");
+          if (sp) *sp = 0;
+        }
         gfx->setTextSize(2);
         gfx->setTextColor(RGB565_WHITE);
-        gfx->print(chgDisp);
+        gfx->setCursor((int16_t)(logoX + logoW + 8), (int16_t)(y + (amtCardH - 16) / 2));
+        gfx->print(amtDisp);
       } else {
-        gfx->setTextSize(2);
-        gfx->setTextColor(RGB565_WHITE);
-        gfx->print(g_cryptoReviewChg[0] ? g_cryptoReviewChg : "-");
+        BTN_PSBT_BITCOIN_UNIT = { 0, -200, 0, 0 };
+      }
+      y = (int16_t)(y + amtCardH + sectionGap);
+    }
+
+    {
+      char destBuf[192];
+      const char* rawDest = g_cryptoReviewDest[0] ? g_cryptoReviewDest : "-";
+      psbt_review_format_dest_chunked(rawDest, destBuf, sizeof(destBuf), 4u);
+      const int16_t destLines = destBuf[0]
+                                  ? (int16_t)(psbt_review_measure_dest_h(destBuf, (uint16_t)contentW, addrLineH, 2, chunkGap)
+                                              / addrLineH)
+                                  : 1;
+      const int16_t destTextH = (int16_t)((destLines > 1 ? (destLines - 1) * addrLineH : 0) + destGlyphH);
+      const int16_t toCardH = (int16_t)(cardPadTop + destTextH + cardPadBot);
+      const int16_t secH = (int16_t)(labelH + labelToCard + toCardH);
+      const bool vis = crypto_tx_review_section_visible(y, secH, contY);
+      if (vis) psbt_review_draw_section_label("To", y, labelCol);
+      y = (int16_t)(y + labelH + labelToCard);
+      if (vis) {
+        psbt_review_draw_section_card(cardX, y, cardW, toCardH, cardBg, cardBorder);
+        int16_t ty = (int16_t)(y + cardPadTop);
+        if (destBuf[0]) {
+          char destDraw[192];
+          strncpy(destDraw, destBuf, sizeof(destDraw) - 1);
+          destDraw[sizeof(destDraw) - 1] = 0;
+          psbt_review_draw_dest_quiet(destDraw, gfx, x0, ty, addrLineH, (uint16_t)contentW, 2, chunkGap);
+        } else {
+          gfx->setTextSize(2);
+          gfx->setTextColor(RGB565_WHITE);
+          gfx->setCursor(x0, ty);
+          gfx->print(rawDest[0] ? rawDest : "-");
+        }
+      }
+      y = (int16_t)(y + toCardH + sectionGap);
+    }
+
+    {
+      const int16_t chgCardH = 44;
+      const int16_t secH = (int16_t)(labelH + labelToCard + chgCardH);
+      const bool vis = crypto_tx_review_section_visible(y, secH, contY);
+      if (vis) psbt_review_draw_section_label("Change", y, labelCol);
+      y = (int16_t)(y + labelH + labelToCard);
+      if (vis) {
+        psbt_review_draw_section_card(cardX, y, cardW, chgCardH, cardBg, cardBorder);
+        gfx->setCursor(x0, (int16_t)(y + (chgCardH - 16) / 2));
+        if (!hasChange) {
+          gfx->setTextSize(2);
+          gfx->setTextColor(mutedVal);
+          gfx->print("None");
+        } else if (g_cryptoReviewSummaryValid && g_cryptoReviewSummary.ok) {
+          char chgDisp[48];
+          psbt_review_format_amount_line(g_cryptoReviewSummary.change_sat, chgDisp, sizeof(chgDisp));
+          gfx->setTextSize(2);
+          gfx->setTextColor(RGB565_WHITE);
+          gfx->print(chgDisp);
+        } else {
+          gfx->setTextSize(2);
+          gfx->setTextColor(RGB565_WHITE);
+          gfx->print(g_cryptoReviewChg[0] ? g_cryptoReviewChg : "-");
+        }
       }
       y = (int16_t)(y + chgCardH + sectionGap);
     }
 
-    // ----- Change address (same size-2 type as To) -----
     if (hasChgAddr) {
       char chgAddrBuf[192];
       psbt_review_format_dest_chunked(g_cryptoReviewChgAddr, chgAddrBuf, sizeof(chgAddrBuf), 4u);
@@ -44777,10 +45431,11 @@ static void drawCryptoReviewPsbt() {
       const int16_t addrTextH = (int16_t)((chgLines > 1 ? (chgLines - 1) * addrLineH : 0) + destGlyphH);
       int16_t addrCardH = (int16_t)(cardPadTop + addrTextH + cardPadBot);
       if (addrCardH < 40) addrCardH = 40;
-      // Only skip Change address if it truly cannot fit; never draw into a undersized card.
-      if (y + labelH + labelToCard + addrCardH <= maxBottom) {
-        psbt_review_draw_section_label("Change address", y, labelCol);
-        y = (int16_t)(y + labelH + labelToCard);
+      const int16_t secH = (int16_t)(labelH + labelToCard + addrCardH);
+      const bool vis = crypto_tx_review_section_visible(y, secH, contY);
+      if (vis) psbt_review_draw_section_label("Change address", y, labelCol);
+      y = (int16_t)(y + labelH + labelToCard);
+      if (vis) {
         psbt_review_draw_section_card(cardX, y, cardW, addrCardH, cardBg, cardBorder);
         int16_t ay = (int16_t)(y + cardPadTop);
         if (chgAddrBuf[0]) {
@@ -44795,7 +45450,22 @@ static void drawCryptoReviewPsbt() {
           gfx->print(g_cryptoReviewChgAddr);
         }
       }
+      y = (int16_t)(y + addrCardH + sectionGap);
     }
+
+    crypto_tx_review_finish_scroll_metrics((int)y, contY);
+    if (g_cryptoTxReviewScrollLite) {
+      esp_task_wdt_reset();
+      yield();
+    }
+  }
+  drawTopBar("Review transaction", true);
+  {
+    const Rect& b = BTN_CRYPTO_REVIEW_PSBT_NEXT;
+    if (g_cryptoTxReviewScrollLite)
+      gfx->fillRect((int16_t)(b.x - 8), (int16_t)(b.y - 8), (int16_t)(b.w + 16), (int16_t)(b.h + 16), RGB565_BLACK);
+    else
+      gfx->fillRoundRect((int16_t)(b.x - 8), (int16_t)(b.y - 8), (int16_t)(b.w + 16), (int16_t)(b.h + 16), 14, RGB565_BLACK);
   }
   drawBtn(BTN_CRYPTO_REVIEW_PSBT_NEXT, "Continue",
           g_cryptoHasUnsigned ? RGB565_BITCOIN_ORANGE : RGB565_DARKGREY, 2);
@@ -44821,7 +45491,7 @@ static int16_t crypto_psbt_fee_line_bounds(Arduino_Canvas* g, int16_t x, int16_t
 
 static void drawCryptoPsbtFee(void) {
   gfx->fillScreen(RGB565_BLACK);
-  drawTopBar("Fee", true);
+  drawTopBar(g_psbtSignConfirmActive ? "Confirm signing" : "Fee", true);
   gfx->setTextColor(RGB565_WHITE);
   const int16_t kExplainGap = 10;  // space after each measured size-2 explanation line
   if (!g_cryptoHasUnsigned) {
@@ -44887,7 +45557,9 @@ static void drawCryptoPsbtFee(void) {
       y = crypto_psbt_fee_line_bounds(gfx, 10, y, RGB565_LIGHTGREY, "on-chain value.", kExplainGap);
     }
   }
-  drawBtn(BTN_CRYPTO_REVIEW_SIGN, "NEXT", g_cryptoHasUnsigned ? RGB565_BITCOIN_ORANGE : RGB565_DARKGREY, 2);
+  if (!g_psbtSignConfirmActive) {
+    drawBtn(BTN_CRYPTO_REVIEW_SIGN, "NEXT", g_cryptoHasUnsigned ? RGB565_BITCOIN_ORANGE : RGB565_DARKGREY, 2);
+  }
   drawPsbtSignConfirmOverlay();
   drawPsbtSignCancelConfirmPopup();
   ui_flush();
@@ -44896,7 +45568,7 @@ static void drawCryptoPsbtFee(void) {
 static void drawCryptoSignedQr() {
   gfx->fillScreen(RGB565_BLACK);
   drawTopBar("Signed PSBT QR", true);
-  if (!g_cryptoHasSigned || !g_cryptoPsbtSignedUr[0]) {
+  if (!g_cryptoHasSigned || !g_cryptoPsbtSignedUr || !g_cryptoPsbtSignedUr[0]) {
     gfx->setTextColor(RGB565_WHITE);
     gfx->setTextSize(1);
     gfx->setCursor(10, 80);
@@ -44907,24 +45579,33 @@ static void drawCryptoSignedQr() {
   }
   gfx->setTextColor(RGB565_LIGHTGREY);
   gfx->setTextSize(1);
-  gfx->setCursor(10, 48);
   if (g_cryptoBcUrFountain) {
-    gfx->print("Fountain UR — hold steady; tap QR: pause / next part");
+    const char* tip = "Animated UR - Hold steady for scan";
+    gfx->setCursor((LCD_W - (int)strlen(tip) * 6) / 2, 48);
+    gfx->print(tip);
   } else {
-    gfx->print("Scan with wallet to broadcast (or next frame if multipart)");
+    const char* tip = "Scan with wallet to broadcast (or next frame if multipart)";
+    gfx->setCursor((LCD_W - (int)strlen(tip) * 6) / 2, 48);
+    gfx->print(tip);
   }
   // ECC_LOW: larger modules / lower density than Quartile — matches Passport-class “show QR to webcam” behavior.
   drawQRAt(g_cryptoPsbtSignedUr, 78, 2, QrCode::Ecc::ECC_LOW);
   gfx->setTextColor(RGB565_WHITE);
   gfx->setTextSize(1);
-  gfx->setCursor(10, 404);
   if (g_cryptoBcUrFountain) {
-    gfx->printf("seq %lu / len %lu  %s  (%u char)",
-                (unsigned long)seedmask_bc_ur_seq_num(), (unsigned long)seedmask_bc_ur_seq_len(),
-                g_cryptoSignedQrAnimPaused ? "PAUSED" : "SCAN",
-                (unsigned)strlen(g_cryptoPsbtSignedUr));
+    char seqLine[48];
+    snprintf(seqLine, sizeof(seqLine), "%lu/%lu %s (%u char)",
+             (unsigned long)seedmask_bc_ur_seq_num(), (unsigned long)seedmask_bc_ur_seq_len(),
+             g_cryptoSignedQrAnimPaused ? "PAUSED" : "SCAN",
+             (unsigned)strlen(g_cryptoPsbtSignedUr));
+    gfx->setCursor((LCD_W - (int)strlen(seqLine) * 6) / 2, 404);
+    gfx->print(seqLine);
   } else {
-    gfx->printf("ur:%s  (%u char)", g_cryptoSignedUrRegistryType, (unsigned)strlen(g_cryptoPsbtSignedUr));
+    char urLine[48];
+    snprintf(urLine, sizeof(urLine), "ur:%s  (%u char)", g_cryptoSignedUrRegistryType,
+             (unsigned)strlen(g_cryptoPsbtSignedUr));
+    gfx->setCursor((LCD_W - (int)strlen(urLine) * 6) / 2, 404);
+    gfx->print(urLine);
   }
   drawBtn(BTN_CRYPTO_SAVE_TX, "Save transaction", UI_CARD, 2);
   drawBtn(BTN_CRYPTO_QR_BACK, "BACK", RGB565_DARKGREY, 2);
@@ -44934,6 +45615,7 @@ static void drawCryptoSignedQr() {
   } else {
     drawBtn(BTN_CRYPTO_QR_NEXT, "NEXT", RGB565_DARKGREY, 2);
   }
+  drawCryptoTxSaveFeedbackCard();
   ui_flush();
 }
 
@@ -46114,6 +46796,10 @@ static void performSwipeBack() {
       }
       break;
     case UIScreen::CRYPTO_KASPA_SIGNED_QR:
+      if ((uint32_t)millis() < g_psbtSlideSuppressSwipeBackUntil || g_psbtSlideCommitBlocksSwipeBack) {
+        g_touchIgnoreUntil = millis() + 120;
+        break;
+      }
       show(UIScreen::CRYPTO_HOME);
       g_touchIgnoreUntil = millis() + 220;
       break;
@@ -46145,7 +46831,14 @@ static void performSwipeBack() {
       }
       break;
     case UIScreen::CRYPTO_REVIEW_PSBT:
+      show(UIScreen::CRYPTO_HOME);
+      g_touchIgnoreUntil = millis() + 220;
+      break;
     case UIScreen::CRYPTO_SIGNED_QR:
+      if ((uint32_t)millis() < g_psbtSlideSuppressSwipeBackUntil || g_psbtSlideCommitBlocksSwipeBack) {
+        g_touchIgnoreUntil = millis() + 120;
+        break;
+      }
       show(UIScreen::CRYPTO_HOME);
       g_touchIgnoreUntil = millis() + 220;
       break;
@@ -46343,6 +47036,9 @@ static void show(UIScreen s) {
     g_duressGamesScrollDragLastY = -1;
   }
   if (s != UIScreen::VIEW_CODE) g_viewCodeSaveSuccessHideAtMs = 0;
+  if (s != UIScreen::CRYPTO_SIGNED_QR && s != UIScreen::CRYPTO_KASPA_SIGNED_QR) {
+    crypto_tx_save_feedback_clear();
+  }
   if (s == UIScreen::VIEW_CODE) {
     // Clear stale global toasts (e.g. accessory "Sent to LCD"); drawViewCode only shows SD-save feedback here.
     setMsg("");
@@ -46532,6 +47228,7 @@ static void show(UIScreen s) {
     g_psbtVisualizeActive = false;
     g_psbtSignConfirmBody[0] = 0;
     psbt_slide_reset();
+    crypto_tx_review_reset_scroll_touch();
     setMsg("");
     crypto_refresh_psbt_review();
   }
@@ -46551,6 +47248,7 @@ static void show(UIScreen s) {
     g_psbtVisualizeActive = false;
     g_psbtSignConfirmBody[0] = 0;
     psbt_slide_reset();
+    crypto_tx_review_reset_scroll_touch();
     setMsg("");
     crypto_refresh_kaspa_review();
   }
@@ -50332,6 +51030,14 @@ static void handleCryptoReviewPsbtTap(uint16_t x, uint16_t y) {
     show(UIScreen::CRYPTO_HOME);
     return;
   }
+  if (crypto_tx_review_can_scroll() && y >= 48 && y < BTN_CRYPTO_REVIEW_PSBT_NEXT.y) {
+    g_cryptoTxReviewTouchPending = true;
+    g_cryptoTxReviewScrolling = false;
+    g_cryptoTxReviewDidDrag = false;
+    g_cryptoTxReviewDownX = (int16_t)x;
+    g_cryptoTxReviewDownY = (int16_t)y;
+    g_cryptoTxReviewDragLastY = -1;
+  }
 }
 
 static void handleCryptoPsbtFeeTap(uint16_t x, uint16_t y) {
@@ -50401,7 +51107,13 @@ static void handleCryptoPsbtFeeTap(uint16_t x, uint16_t y) {
 
 static void handleCryptoSignedQrTap(uint16_t x, uint16_t y) {
   if (hit(BTN_CRYPTO_SAVE_TX, x, y)) {
-    if (crypto_save_signed_psbt_to_sd()) draw();
+    (void)crypto_save_signed_psbt_to_sd();
+    draw();
+    if (!crypto_tx_save_feedback_active() && g_msg[0]) {
+      menu_draw_message_card_overlay();
+      ui_flush();
+    }
+    g_touchIgnoreUntil = millis() + 350;
     return;
   }
   if (hit(BTN_TOP_BURGER, x, y) || hit(BTN_CRYPTO_QR_BACK, x, y)) {
@@ -54208,6 +54920,8 @@ void setup() {
 
   // NVS save runs in this task so loop task stack is never used for nvs_save_vault
   xTaskCreate(nvs_save_task, "nvs_save", 4096, NULL, 1, &g_nvs_save_task_handle);
+  // Signing spinner: yields every frame (safe for TWDT). Paint only while g_cryptoSignInProgress.
+  xTaskCreatePinnedToCore(crypto_sign_spinner_task, "sign_spin", 8192, NULL, 1, &g_cryptoSignSpinnerTask, 0);
 
   setMsg("");
   load_unix_time_from_prefs();
@@ -54367,6 +55081,14 @@ void loop() {
     g_viewCodeSaveSuccessHideAtMs = 0;
     if (g_screen == UIScreen::VIEW_CODE) {
       setMsg("");
+      draw();
+    }
+  }
+
+  if (g_cryptoTxSaveFeedbackUntilMs != 0
+      && (int32_t)(millis() - g_cryptoTxSaveFeedbackUntilMs) >= 0) {
+    crypto_tx_save_feedback_clear();
+    if (g_screen == UIScreen::CRYPTO_SIGNED_QR || g_screen == UIScreen::CRYPTO_KASPA_SIGNED_QR) {
       draw();
     }
   }
@@ -54551,7 +55273,8 @@ void loop() {
 
   // Animated BC-UR fountain parts (Blockchain Commons — same sequence as Passport Core)
   if (g_screen == UIScreen::CRYPTO_SIGNED_QR && g_cryptoHasSigned && g_cryptoPsbtSignedUr[0]
-      && g_cryptoBcUrFountain && !g_cryptoSignedQrAnimPaused && !g_busy) {
+      && g_cryptoBcUrFountain && !g_cryptoSignedQrAnimPaused && !g_busy
+      && !crypto_tx_save_feedback_active()) {
     uint32_t now = millis();
     if ((uint32_t)(now - g_cryptoSignedQrLastAnimMs) >= CRYPTO_SIGNED_QR_ANIM_INTERVAL_MS) {
       g_cryptoSignedQrLastAnimMs = now;
@@ -54574,7 +55297,8 @@ void loop() {
 
   // Kaspa signed multi-input: animated ur:bytes/ (static encodeText overflows QR v16 above ~2 sigs).
   if (g_screen == UIScreen::CRYPTO_KASPA_SIGNED_QR && g_kaspaHasSigned && g_kaspaSignedUrFountain
-      && g_cryptoPsbtSignedUr && g_cryptoPsbtSignedUr[0] && !g_kaspaSignedQrAnimPaused && !g_busy) {
+      && g_cryptoPsbtSignedUr && g_cryptoPsbtSignedUr[0] && !g_kaspaSignedQrAnimPaused && !g_busy
+      && !crypto_tx_save_feedback_active()) {
     uint32_t now = millis();
     if ((uint32_t)(now - g_kaspaSignedQrLastAnimMs) >= CRYPTO_SIGNED_QR_ANIM_INTERVAL_MS) {
       g_kaspaSignedQrLastAnimMs = now;
@@ -54825,10 +55549,27 @@ void loop() {
         g_kaspaPsktScanLen = len;
         g_kaspaExpectedAddr[0] = 0;
         g_kaspaKpubStatus = -1;
-        kaspa_review_refresh_kpub_status();
         g_qrScanning = false;
         stop_qr_scan();
         g_syncTouchAfterQrScan = true;
+        if (!kaspa_accept_loaded_unsigned_for_wallet()) {
+          const bool askImport = seedmask_kaspa_unsigned_has_multisig_redeem(g_kaspaPsktScanBuf, g_kaspaPsktScanLen)
+                                 && g_kaspaMultisigPolicyMode == KaspaMultisigPolicyMode::ASK_TO_IMPORT
+                                 && !kaspa_has_imported_multisig_policy_for_current_account();
+          char errKeep[96];
+          strncpy(errKeep, g_msg, sizeof(errKeep) - 1);
+          errKeep[sizeof(errKeep) - 1] = 0;
+          kaspa_clear_loaded_unsigned();
+          if (askImport) {
+            show(UIScreen::CRYPTO_MULTISIG_IMPORT);
+            setMsg(errKeep[0] ? errKeep : "Import multisig policy first");
+          } else {
+            show(UIScreen::CRYPTO_SIGN_SOURCE);
+            setMsg(errKeep);
+          }
+          waitTouchRelease(250);
+          return;
+        }
         setMsg("PSKT captured");
         show(UIScreen::CRYPTO_REVIEW_KASPA_TX);
         waitTouchRelease(250);
@@ -55497,39 +56238,17 @@ void loop() {
       if ((uint32_t)(now - g_psbtSlideDragReleaseStartMs) >= PSBT_SLIDE_DRAG_RELEASE_DEBOUNCE_MS) {
         g_psbtSlideDragging = false;
         g_psbtSlideDragReleaseStartMs = 0;
-        int16_t maxO = psbt_slide_max_offset();
-        int16_t thresh =
-          maxO > 0 ? (int16_t)(((int32_t)maxO * (int32_t)76) / (int32_t)100) : (int16_t)0;
-        if (maxO > 0 && g_psbtSlideThumbOffset >= thresh) {
-          g_psbtSlideSuppressSwipeBackUntil = millis() + PSBT_SLIDE_POST_COMMIT_SWIPE_BLOCK_MS;
-          g_cryptoAutoSignPending = false;
-          psbt_slide_reset();
-          if (g_screen == UIScreen::CRYPTO_KASPA_FEE) {
-            // Keep confirm active until success (same as PSBT) — clearing early flashes Fee again.
-            setMsg("Signing Kaspa tx…");
-            draw();
-            kaspa_run_sign();
-            if (g_kaspaHasSigned) {
-              g_psbtSignConfirmActive = false;
-              g_psbtVisualizeActive = false;
-              g_touchIgnoreUntil = millis() + 320;
-            } else {
-              g_psbtSignConfirmActive = true;
-              draw();
-            }
-          } else {
-            setMsg("Signing PSBT…");
-            crypto_build_signed_psbt_from_scanned();
-            if (g_cryptoHasSigned) {
-              g_psbtSignConfirmActive = false;
-              g_psbtVisualizeActive = false;
-              show(UIScreen::CRYPTO_SIGNED_QR);
-              g_touchIgnoreUntil = millis() + 320;
-            } else {
-              g_psbtSignConfirmActive = true;
-              draw();
-            }
-          }
+        // Final position from last finger X (skip slew lag that left the thumb short of the end).
+        {
+          int16_t maxO = psbt_slide_max_offset();
+          uint16_t xLift = lastSx;
+          if (xLift >= LCD_W) xLift = (uint16_t)(LCD_W - 1);
+          int16_t liftOff = psbt_slide_stable_offset_from_x(xLift, maxO, -1);
+          if (liftOff > g_psbtSlideThumbOffset) g_psbtSlideThumbOffset = liftOff;
+          if (psbt_slide_finger_in_commit_zone(xLift) && maxO > 0) g_psbtSlideThumbOffset = maxO;
+        }
+        if (psbt_slide_past_commit_threshold() || psbt_slide_finger_in_commit_zone(lastSx)) {
+          psbt_slide_commit_sign();
         } else {
           psbt_slide_reset();
           draw();
@@ -55573,16 +56292,27 @@ void loop() {
       int16_t maxO = psbt_slide_max_offset();
       int16_t targetOff = psbt_slide_stable_offset_from_x(xSmooth, maxO, g_psbtSlideThumbOffset);
       int16_t fingerOff = psbt_slide_slew_toward(targetOff, g_psbtSlideThumbOffset, maxO);
+      // If finger is already in the commit zone, snap thumb to the end (don't wait on slew).
+      if (psbt_slide_finger_in_commit_zone(xSmooth) && maxO > 0) fingerOff = maxO;
       if (fingerOff != g_psbtSlideThumbOffset) {
         g_psbtSlideThumbOffset = fingerOff;
         const uint32_t n = millis();
-        const bool atEnd = (fingerOff <= 0 || (maxO > 0 && fingerOff >= maxO));
+        const bool atEnd = (maxO > 0 && fingerOff >= maxO);
         const int dPaint = abs((int)fingerOff - (int)g_psbtSlidePaintedOffset);
         if (atEnd || dPaint >= 2 || (uint32_t)(n - g_psbtSlideDragPaintMs) >= 12u) {
           g_psbtSlideDragPaintMs = n;
           g_psbtSlidePaintedOffset = fingerOff;
           draw();
         }
+      }
+      // Commit when thumb/finger reaches the end — don't require a perfect release.
+      if (maxO > 0
+          && (g_psbtSlideThumbOffset >= maxO || psbt_slide_finger_in_commit_zone(xSmooth))) {
+        g_psbtSlideDragging = false;
+        g_psbtSlideDragReleaseStartMs = 0;
+        psbt_slide_commit_sign();
+        wasPressed = pressed;
+        return;
       }
     }
     wasPressed = pressed;
@@ -56453,6 +57183,7 @@ void loop() {
                                              : (dx >= minDxSwipe && dx > abs(dy));
       if (swipeDirOk && !startedOnKeyboard && !startedOnBrightnessBar && !brightnessBarDragRelease
           && !startedOnPsbtSlideRail && !g_psbtSlideDragging && !g_psbtSlideAwaitSwipe
+          && !g_psbtSlideCommitBlocksSwipeBack
           && (uint32_t)now >= g_psbtSlideSuppressSwipeBackUntil) {
         // Password editor active field: swipe-right should collapse to details view, not leave to list.
         if (g_screen == UIScreen::EDITOR && g_editMode == EditMode::EDIT_PW_VALUE && g_pwEditKeyboardVisible && g_pwEditFocusField >= 1 && g_pwEditFocusField <= 5 && !pwEditorFocusSwipeDownInsideStrip((int16_t)g_swipeDownX, (int16_t)g_swipeDownY)) {
@@ -56740,6 +57471,13 @@ void loop() {
     g_brightnessBarDragging = false;
     g_pwFocusSwipeTracking = false;
     g_multisigReviewDragging = false;
+    if (g_cryptoTxReviewNeedsDraw
+        && (g_screen == UIScreen::CRYPTO_REVIEW_KASPA_TX || g_screen == UIScreen::CRYPTO_REVIEW_PSBT)) {
+      crypto_tx_review_scroll_present(true);
+    }
+    g_cryptoTxReviewTouchPending = false;
+    g_cryptoTxReviewScrolling = false;
+    g_cryptoTxReviewDragLastY = -1;
   }
 
   // While finger is down: password-editor swipe-right hides keyboard; hold on Del repeats backspace.
@@ -56822,6 +57560,46 @@ after_hold_del:
     draw();
     wasPressed = pressed;
     return;
+  }
+  // Crypto Review (Kaspa + BTC): scroll only when content overflows.
+  if (pressed && wasPressed && g_editMode == EditMode::NONE
+      && (g_screen == UIScreen::CRYPTO_REVIEW_KASPA_TX || g_screen == UIScreen::CRYPTO_REVIEW_PSBT)
+      && crypto_tx_review_can_scroll()
+      && (g_cryptoTxReviewTouchPending || g_cryptoTxReviewScrolling)) {
+    const int ddx = abs((int)sx - (int)g_cryptoTxReviewDownX);
+    const int ddy = abs((int)sy - (int)g_cryptoTxReviewDownY);
+    const int kEngage = 8;
+    if (!g_cryptoTxReviewScrolling) {
+      if (ddy > kEngage && ddy >= ddx) {
+        g_cryptoTxReviewScrolling = true;
+        g_cryptoTxReviewDidDrag = true;
+        g_cryptoTxReviewDragLastY = (int16_t)sy;
+      }
+    } else {
+      if (g_cryptoTxReviewDragLastY < 0) {
+        g_cryptoTxReviewDragLastY = (int16_t)sy;
+      } else {
+        int delta = (int)sy - (int)g_cryptoTxReviewDragLastY;
+        g_cryptoTxReviewDragLastY = (int16_t)sy;
+        if (delta != 0) {
+          const int16_t prev = g_cryptoTxReviewScrollY;
+          g_cryptoTxReviewScrollY = (int16_t)((int)g_cryptoTxReviewScrollY + delta);
+          crypto_tx_review_clamp_scroll();
+          if (g_cryptoTxReviewScrollY != prev) g_cryptoTxReviewNeedsDraw = true;
+        }
+      }
+      // Always feed WDT while finger is down scrolling.
+      esp_task_wdt_reset();
+      if (g_cryptoTxReviewNeedsDraw) {
+        const uint32_t t = millis();
+        // ~30fps: scrollY tracks 1:1 every sample; present uses latest offset.
+        if ((t - g_cryptoTxReviewLastDrawMs) >= 33u) {
+          crypto_tx_review_scroll_present(false);
+        }
+      }
+      wasPressed = pressed;
+      return;
+    }
   }
 
   // Password field: drag left/right to scroll through long password (or long-press 1s for full password popup)
@@ -56993,6 +57771,8 @@ after_hold_del:
   }
 
   if (pressed && !wasPressed && g_touchReleasedSinceTap) {
+    // New finger-down ends the post-slide swipe-back block (signed QR may already be showing).
+    g_psbtSlideCommitBlocksSwipeBack = false;
     // VIEW_CODE Save to SD: handled at first touch-down in loop (right after g_multisigEdgeDeferTap = false)
     // so it runs before g_touchIgnoreUntil / swipe-reserve — do not duplicate here.
     // After swipe-back transitions, ignore the first touch-down briefly to prevent
@@ -57018,6 +57798,8 @@ after_hold_del:
         g_touchReleasedSinceTap = false;
         if (!g_kaspaPsktScanLen || !g_kaspaPsktScanBuf[0]) {
           setMsg("No Kaspa tx scanned");
+          draw();
+        } else if (!kaspa_accept_loaded_unsigned_for_wallet()) {
           draw();
         } else {
           show(UIScreen::CRYPTO_KASPA_FEE);

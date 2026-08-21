@@ -36,6 +36,9 @@ bool seedmask_kaspa_sign_with_mnemonic(const char* json, size_t json_len, const 
                                        const char* bip39_passphrase, uint32_t expected_account, char* out_json,
                                        size_t out_cap, size_t* out_len, char* err, size_t err_len);
 
+/** True when unsigned JSON has a non-empty multisig redeem script (not PSKT null stubs). */
+bool seedmask_kaspa_unsigned_has_multisig_redeem(const char* json, size_t json_len);
+
 /** True when json contains top-level "version": 2 (Coordinator / pretty-print tolerant). */
 bool seedmask_kaspa_unsigned_is_v2(const char* json, size_t json_len);
 
@@ -60,6 +63,10 @@ typedef struct {
   /** Fee as tenths of a percent of send (same idea as PSBT review). */
   uint32_t fee_pct_of_send_tenths;
   bool big_fee_warn;
+  /** Multisig redeem present: m-of-n from first redeem script (0/0 if unknown). */
+  bool is_multisig;
+  uint8_t ms_required;
+  uint8_t ms_total;
   char dest_addr[96];
   char change_addr[96];
   char err[48];

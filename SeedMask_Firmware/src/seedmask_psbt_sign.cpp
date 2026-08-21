@@ -2319,6 +2319,45 @@ extern "C" bool seedmask_psbt_review_summarize(const uint8_t* psbt, size_t len, 
     out->fee_pct_of_send_tenths = (uint32_t)((fee * 1000ULL) / fee_denom);
     if (fee * 100ULL > fee_denom * 5ULL) out->big_fee_warn = 1;
   }
+
+  out->is_multisig = false;
+  out->ms_required = 0;
+  out->ms_total = 0;
+  out->device_is_cosigner = 0;
+  {
+    auto script_is_multisig_mn = [](const std::vector<uint8_t>& sc, uint8_t* m, uint8_t* n) -> bool {
+      if (sc.size() < 37 || sc.back() != 0xae) return false;  // OP_CHECKMULTISIG
+      const uint8_t op_m = sc.front();
+      const uint8_t op_n = sc[sc.size() - 2];
+      if (op_m < 0x51 || op_m > 0x60 || op_n < 0x51 || op_n > 0x60) return false;
+      *m = (uint8_t)(op_m - 0x50);
+      *n = (uint8_t)(op_n - 0x50);
+      return *m >= 1 && *n >= *m && *n <= 16;
+    };
+    bool fp_seen = false;
+    for (size_t i = 0; i < n_in; i++) {
+      std::vector<uint8_t> witness_script;
+      std::vector<uint8_t> redeem_script;
+      for (const auto& kv : in_maps[i]) {
+        if (kv.first.size() == 1 && kv.first[0] == 0x05) witness_script = kv.second;  // PSBT_IN_WITNESS_SCRIPT
+        if (kv.first.size() == 1 && kv.first[0] == 0x04) redeem_script = kv.second;    // PSBT_IN_REDEEM_SCRIPT
+        if (kv.first.size() == 34 && kv.first[0] == 0x06 && kv.second.size() >= 4) {
+          if (memcmp(kv.second.data(), master_fp, 4) == 0) fp_seen = true;
+        }
+      }
+      uint8_t m = 0, n = 0;
+      if ((!witness_script.empty() && script_is_multisig_mn(witness_script, &m, &n))
+          || (!redeem_script.empty() && script_is_multisig_mn(redeem_script, &m, &n))) {
+        out->is_multisig = true;
+        if (out->ms_required == 0) {
+          out->ms_required = m;
+          out->ms_total = n;
+        }
+      }
+    }
+    if (out->is_multisig) out->device_is_cosigner = fp_seen ? (int8_t)1 : (int8_t)2;
+  }
+
   out->ok = 1;
   return true;
 }

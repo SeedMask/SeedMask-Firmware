@@ -83,6 +83,12 @@ typedef struct seedmask_psbt_review {
   uint8_t first_change_spk[40];
   int big_fee_warn;
   uint32_t fee_pct_of_send_tenths; /* fee*1000/(send+change); e.g. 125 = 12.5% (misnamed "send" — denom is all outputs) */
+  /** Multisig witness/redeem present: m-of-n (0/0 if unknown). */
+  bool is_multisig;
+  uint8_t ms_required;
+  uint8_t ms_total;
+  /** 1 = this master fingerprint is a cosigner, 2 = not, 0 = unknown / singlesig. */
+  int8_t device_is_cosigner;
   /** Visualizer: up to N inputs with BIP32 receive/change index (matching master_fp). */
   uint8_t num_inputs;
   uint8_t num_viz_inputs;

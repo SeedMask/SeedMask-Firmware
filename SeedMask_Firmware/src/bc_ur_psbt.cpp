@@ -14,6 +14,7 @@
 
 static std::unique_ptr<ur::UR> g_bcUr;
 static std::unique_ptr<ur::UREncoder> g_bcUrEnc;
+static size_t g_bcUrMaxFragmentLen = 0;
 
 static ur::ByteVector cbor_wrap_psbt(const uint8_t* psbt, size_t len) {
   ur::ByteVector buf;
@@ -22,9 +23,21 @@ static ur::ByteVector cbor_wrap_psbt(const uint8_t* psbt, size_t len) {
   return buf;
 }
 
+static bool bc_ur_recreate_encoder(void) {
+  if (!g_bcUr || g_bcUrMaxFragmentLen < 10) return false;
+  try {
+    g_bcUrEnc = std::make_unique<ur::UREncoder>(*g_bcUr, g_bcUrMaxFragmentLen, 0, 10);
+    return true;
+  } catch (...) {
+    g_bcUrEnc.reset();
+    return false;
+  }
+}
+
 extern "C" void seedmask_bc_ur_reset(void) {
   g_bcUrEnc.reset();
   g_bcUr.reset();
+  g_bcUrMaxFragmentLen = 0;
 }
 
 extern "C" bool seedmask_bc_ur_begin_psbt_ex(const uint8_t* psbt, size_t len, size_t max_fragment_len,
@@ -35,6 +48,7 @@ extern "C" bool seedmask_bc_ur_begin_psbt_ex(const uint8_t* psbt, size_t len, si
     const char* t = ur_type && ur_type[0] ? ur_type : "crypto-psbt";
     ur::ByteVector cbor = cbor_wrap_psbt(psbt, len);
     g_bcUr = std::make_unique<ur::UR>(std::string(t), cbor);
+    g_bcUrMaxFragmentLen = max_fragment_len;
     // Passport / bc-ur reference: first_seq_num=0, min_fragment_len=10 (Blockchain Commons UREncoder defaults).
     g_bcUrEnc = std::make_unique<ur::UREncoder>(*g_bcUr, max_fragment_len, 0, 10);
     return true;
@@ -51,6 +65,11 @@ extern "C" bool seedmask_bc_ur_begin_psbt(const uint8_t* psbt, size_t len, size_
 extern "C" bool seedmask_bc_ur_next_part(char* out, size_t outCap) {
   if (!g_bcUrEnc || !out || outCap < 2) return false;
   try {
+    // After a full simple pass (1..seq_len), restart so the animation loops 1..N like a normal multipart QR
+    // instead of climbing forever into fountain XOR parts (seq > seq_len).
+    if (g_bcUrEnc->seq_len() > 1 && g_bcUrEnc->seq_num() >= g_bcUrEnc->seq_len()) {
+      if (!bc_ur_recreate_encoder()) return false;
+    }
     std::string s = g_bcUrEnc->next_part();
     if (s.size() >= outCap) return false;
     std::memcpy(out, s.c_str(), s.size());

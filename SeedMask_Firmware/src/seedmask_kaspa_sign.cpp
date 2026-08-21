@@ -322,9 +322,7 @@ static bool json_has_key(const char* obj, const char* key) {
   return json_find_key(obj, key, &p);
 }
 
-static bool json_has_kaspa_multisig_redeem(const char* json) {
-  return json && (strstr(json, "\"redeem_script_hex\"") != nullptr || strstr(json, "\"redeemScript\"") != nullptr);
-}
+static bool json_has_kaspa_multisig_redeem(const char* json);  // after json_array_nth_object
 
 static const char* json_skip_ws(const char* p) {
   while (p && (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n')) p++;
@@ -390,6 +388,24 @@ static const char* json_array_nth_object(const char* json, const char* array_key
     }
   }
   return nullptr;
+}
+
+static bool json_has_kaspa_multisig_redeem(const char* json) {
+  /* Must be a non-empty hex redeem — PSKT serde often emits "redeemScript": null on singlesig. */
+  if (!json) return false;
+  for (size_t i = 0;; i++) {
+    const char* inp = json_array_nth_object(json, "inputs", i);
+    if (!inp) break;
+    uint8_t redeem[KASPA_SIGN_MAX_REDEEM];
+    size_t redeem_len = 0;
+    if (json_parse_hex_field(inp, "redeem_script_hex", redeem, sizeof(redeem), &redeem_len) && redeem_len > 0) {
+      return true;
+    }
+    if (json_parse_hex_field(inp, "redeemScript", redeem, sizeof(redeem), &redeem_len) && redeem_len > 0) {
+      return true;
+    }
+  }
+  return false;
 }
 
 static void kaspa_addr_ascii_lower(const char* in, char* out, size_t cap) {
@@ -716,6 +732,11 @@ extern "C" bool seedmask_kaspa_unsigned_is_v2(const char* json, size_t json_len)
   return json_parse_u32(json, "version", &ver) && ver == 2;
 }
 
+extern "C" bool seedmask_kaspa_unsigned_has_multisig_redeem(const char* json, size_t json_len) {
+  (void)json_len;
+  return json_has_kaspa_multisig_redeem(json);
+}
+
 extern "C" int seedmask_kaspa_unsigned_kpub_status(const char* json, size_t json_len, uint32_t account) {
   if (!json || json_len < 10) return 0;
   const bool is_multisig = json_has_kaspa_multisig_redeem(json);
@@ -726,10 +747,15 @@ extern "C" int seedmask_kaspa_unsigned_kpub_status(const char* json, size_t json
   } else if (json_parse_string_field(json, "xpub", tx_kpub, sizeof(tx_kpub)) && tx_kpub[0]) {
     has_tx_kpub = true;
   }
+  if (is_multisig) {
+    // Cosigner check is authoritative for multisig (tx may omit kpub or carry a coordinator watch kpub).
+    if (kaspa_device_pubkey_in_unsigned_redeem(json, account)) return 1;
+    if (has_tx_kpub && seedmask_wallet_kaspa_imported_kpub_matches(account, tx_kpub)) return 1;
+    return 2;  // this device is not a signer for this policy/tx
+  }
   if (!has_tx_kpub) return 0;
   if (seedmask_wallet_kaspa_imported_kpub_matches(account, tx_kpub)) return 1;
-  if (is_multisig && kaspa_device_pubkey_in_unsigned_redeem(json, account)) return 1;
-  return is_multisig ? 0 : 2;
+  return 2;
 }
 
 static bool kaspa_script_to_mainnet_address(const uint8_t* script, size_t script_len, char* out, size_t out_len) {
@@ -841,7 +867,7 @@ extern "C" bool seedmask_kaspa_review_summarize(const char* json, size_t json_le
       const char* obj = json_array_nth_object(json, "outputs", (size_t)first_change);
       if (!obj || (!json_parse_string_field(obj, "kaspa_address", out->change_addr, sizeof(out->change_addr))
                    && !json_parse_string_field(obj, "to_address", out->change_addr, sizeof(out->change_addr)))) {
-        out->change_addr[0] = 0;
+        snprintf(out->change_addr, sizeof(out->change_addr), "(see outputs)");
       }
     }
   }
@@ -874,6 +900,33 @@ extern "C" bool seedmask_kaspa_review_summarize(const char* json, size_t json_le
     out->viz_input_index[slot] = addr_index;
     out->viz_input_sompi[slot] = tx.inputs[i].utxo_amount;
     out->num_viz_inputs = (uint8_t)(slot + 1);
+  }
+
+  out->is_multisig = false;
+  out->ms_required = 0;
+  out->ms_total = 0;
+  if (json_has_kaspa_multisig_redeem(json)) {
+    const char* inp0 = json_array_nth_object(json, "inputs", 0);
+    if (inp0) {
+      uint8_t redeem[KASPA_SIGN_MAX_REDEEM];
+      size_t redeem_len = 0;
+      const char* redeem_key = json_has_key(inp0, "redeem_script_hex") ? "redeem_script_hex"
+                             : (json_has_key(inp0, "redeemScript") ? "redeemScript" : nullptr);
+      if (redeem_key
+          && json_parse_hex_field(inp0, redeem_key, redeem, sizeof(redeem), &redeem_len)
+          && redeem_len > 0) {
+        uint8_t req = 0, tot = 0;
+        if (kaspa_validate_multisig_redeem_script(redeem, redeem_len, &req, &tot)) {
+          out->is_multisig = true;
+          out->ms_required = req;
+          out->ms_total = tot;
+        }
+        sp_zero(redeem, sizeof(redeem));
+      }
+    }
+    if (!out->is_multisig) {
+      out->is_multisig = true;  // redeem present even if m/n parse failed
+    }
   }
 
   out->ok = true;
